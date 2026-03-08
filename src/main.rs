@@ -325,8 +325,10 @@ async fn discover_and_monitor(
             if let (Some(up_snap), Some(down_snap)) = (up_snapshot, down_snapshot) {
                 let price_data = create_price_data(&coin, Some(&up_snap), Some(&down_snap), &env);
 
-                // Feed velocity tracker with every update
-                velocity.lock().await.update(price_data.ask_sum);
+                // Feed velocity tracker with every update (only when enabled)
+                if env.velocity_enabled {
+                    velocity.lock().await.update(price_data.ask_sum);
+                }
 
                 if time_until_end > 0 && time_until_end < 60000 {
                     let now_ms = chrono::Utc::now().timestamp_millis();
