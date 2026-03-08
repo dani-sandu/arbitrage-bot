@@ -222,91 +222,75 @@ pub async fn execute_arbitrage_trade(
         execute_buy_order(&client_down, &down_tid, "DOWN", token_amount, down_price),
     );
 
-    let both_success = up_result.success && down_result.success;
+    let both_submitted = up_result.success && down_result.success;
+    let mut both_filled = false;
 
-    if both_success {
-        println!(
-            "{}",
-            format!(
-                "\n╔═══════════════════════════════════════════════╗\n║  🎉 ARBITRAGE COMPLETED SUCCESSFULLY          ║\n╚═══════════════════════════════════════════════╝\n  UP:   {:.2} tokens @ ${:.4} = ${:.2}\n  DOWN: {:.2} tokens @ ${:.4} = ${:.2}\n  Total: ${:.2} USDC | Net profit: ~${:.4}\n",
+    if both_submitted {
+        // Both orders accepted by CLOB — verify actual fills on-chain before celebrating.
+        // FAK orders can be accepted but not filled if liquidity disappeared.
+        let (up_actual, down_actual) = poll_fill_balances(
+            env, up_token_id, down_token_id, token_amount,
+        ).await;
+
+        let fill_threshold = token_amount * 0.5;
+        let up_filled = up_actual >= fill_threshold;
+        let down_filled = down_actual >= fill_threshold;
+
+        if up_filled && down_filled {
+            both_filled = true;
+            println!(
+                "{}",
+                format!(
+                    "\n╔═══════════════════════════════════════════════╗\n║  🎉 ARBITRAGE COMPLETED SUCCESSFULLY          ║\n╚═══════════════════════════════════════════════╝\n  UP:   {:.2} tokens @ ${:.4} = ${:.2} (on-chain: {:.2})\n  DOWN: {:.2} tokens @ ${:.4} = ${:.2} (on-chain: {:.2})\n  Total: ${:.2} USDC | Net profit: ~${:.4}\n",
+                    up_result.tokens_bought.unwrap_or(0.0), up_result.price, up_result.amount, up_actual,
+                    down_result.tokens_bought.unwrap_or(0.0), down_result.price, down_result.amount, down_actual,
+                    up_result.amount + down_result.amount,
+                    net_spread * token_amount,
+                )
+                .green()
+                .bold()
+            );
+            let msg = format!(
+                "🎉 ARBITRAGE COMPLETED\nUP: {:.2} tokens @ ${:.4} = ${:.2}\nDOWN: {:.2} tokens @ ${:.4} = ${:.2}\nTotal: ${:.2} USDC\nNet profit: ~${:.4}",
                 up_result.tokens_bought.unwrap_or(0.0), up_result.price, up_result.amount,
                 down_result.tokens_bought.unwrap_or(0.0), down_result.price, down_result.amount,
                 up_result.amount + down_result.amount,
                 net_spread * token_amount,
-            )
-            .green()
-            .bold()
-        );
-        let msg = format!(
-            "🎉 ARBITRAGE COMPLETED\nUP: {:.2} tokens @ ${:.4} = ${:.2}\nDOWN: {:.2} tokens @ ${:.4} = ${:.2}\nTotal: ${:.2} USDC\nNet profit: ~${:.4}",
-            up_result.tokens_bought.unwrap_or(0.0), up_result.price, up_result.amount,
-            down_result.tokens_bought.unwrap_or(0.0), down_result.price, down_result.amount,
-            up_result.amount + down_result.amount,
-            net_spread * token_amount,
-        );
-        send_telegram_alert(&msg).await;
-    } else {
-        // Attempt to unwind the filled leg to prevent directional exposure.
-        // Use a bounded exit price derived from the buy price and max_unwind_slippage,
-        // instead of a hardcoded fire-sale price.
-        if up_result.success && !down_result.success {
-            let size = floor_to_decimals(up_result.tokens_bought.unwrap_or(0.0), TOKEN_DECIMALS);
-            if size >= MIN_TOKEN_AMOUNT {
-                let unwind_price = compute_unwind_price(up_result.price, env.max_unwind_slippage);
-                println!(
-                    "{}",
-                    format!(
-                        "Attempting to unwind UP leg... (sell {:.2} @ ${:.4}, max slippage {:.0}%)",
-                        size, unwind_price, env.max_unwind_slippage * 100.0
-                    )
-                    .yellow()
-                );
-                match clob_client.submit_order(up_token_id, OrderSide::Sell, unwind_price, size).await {
-                    Ok(_) => {
-                        println!("{}", "✓ UP leg unwound".green());
-                        send_telegram_alert(&format!(
-                            "🔄 Unwound UP leg ({:.2} tokens @ ${:.4})", size, unwind_price
-                        )).await;
-                    }
-                    Err(e) => {
-                        let msg = format!("⚠️ UNWIND FAILED (UP): {} — {:.2} tokens may remain exposed", e, size);
-                        println!("{}", msg.red());
-                        send_telegram_alert(&msg).await;
-                        log_error(&msg, Some("unwind_up"));
-                    }
-                }
-            }
-        } else if down_result.success && !up_result.success {
-            let size = floor_to_decimals(down_result.tokens_bought.unwrap_or(0.0), TOKEN_DECIMALS);
-            if size >= MIN_TOKEN_AMOUNT {
-                let unwind_price = compute_unwind_price(down_result.price, env.max_unwind_slippage);
-                println!(
-                    "{}",
-                    format!(
-                        "Attempting to unwind DOWN leg... (sell {:.2} @ ${:.4}, max slippage {:.0}%)",
-                        size, unwind_price, env.max_unwind_slippage * 100.0
-                    )
-                    .yellow()
-                );
-                match clob_client.submit_order(down_token_id, OrderSide::Sell, unwind_price, size).await {
-                    Ok(_) => {
-                        println!("{}", "✓ DOWN leg unwound".green());
-                        send_telegram_alert(&format!(
-                            "🔄 Unwound DOWN leg ({:.2} tokens @ ${:.4})", size, unwind_price
-                        )).await;
-                    }
-                    Err(e) => {
-                        let msg = format!("⚠️ UNWIND FAILED (DOWN): {} — {:.2} tokens may remain exposed", e, size);
-                        println!("{}", msg.red());
-                        send_telegram_alert(&msg).await;
-                        log_error(&msg, Some("unwind_down"));
-                    }
-                }
-            }
+            );
+            send_telegram_alert(&msg).await;
+        } else {
+            // One or both orders were accepted but NOT filled on-chain
+            let fail_detail = format!(
+                "ON-CHAIN FILL MISMATCH — UP: {:.2}/{:.2}, DOWN: {:.2}/{:.2}",
+                up_actual, token_amount, down_actual, token_amount
+            );
+            println!("{}", format!("⚠️  {}", fail_detail).red().bold());
+            log_error(&fail_detail, Some("fill_verification"));
+
+            attempt_unwind_after_partial_fill(
+                clob_client, env,
+                up_token_id, down_token_id,
+                &up_result, &down_result,
+                up_filled, down_filled,
+                up_actual, down_actual,
+            ).await;
+
+            let msg = format!("⚠️ ARBITRAGE FILL FAILED\n{}", fail_detail);
+            send_telegram_alert(&msg).await;
         }
+    } else {
+        // One order failed to even submit to CLOB — unwind the submitted leg
+        attempt_unwind_after_partial_fill(
+            clob_client, env,
+            up_token_id, down_token_id,
+            &up_result, &down_result,
+            up_result.success, down_result.success,
+            if up_result.success { up_result.tokens_bought.unwrap_or(0.0) } else { 0.0 },
+            if down_result.success { down_result.tokens_bought.unwrap_or(0.0) } else { 0.0 },
+        ).await;
 
         let error_msg = format!(
-            "Arbitrage partially failed - UP: {}, DOWN: {}",
+            "Arbitrage submission failed - UP: {}, DOWN: {}",
             if up_result.success { "OK".to_string() } else { up_result.error.clone().unwrap_or_default() },
             if down_result.success { "OK".to_string() } else { down_result.error.clone().unwrap_or_default() },
         );
@@ -316,62 +300,130 @@ pub async fn execute_arbitrage_trade(
         send_telegram_alert(&msg).await;
     }
 
-    // Best-effort on-chain fill verification
-    verify_positions_on_chain(env, up_token_id, down_token_id, &up_result, &down_result).await;
-
-    Ok((up_result, down_result, both_success))
+    Ok((up_result, down_result, both_filled))
 }
 
-/// Query on-chain CTF balances and log whether they match expected fills.
-/// This is best-effort — failures here do not block the trade flow.
-async fn verify_positions_on_chain(
+/// Poll on-chain CTF balances to verify actual fills after order submission.
+/// Retries a few times with delays to account for on-chain settlement lag.
+/// Returns (up_balance, down_balance).
+async fn poll_fill_balances(
+    env: &Env,
+    up_token_id: &str,
+    down_token_id: &str,
+    expected_tokens: f64,
+) -> (f64, f64) {
+    const MAX_ATTEMPTS: u32 = 4;
+    const DELAY_SECS: u64 = 2;
+    let fill_threshold = expected_tokens * 0.5;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        tokio::time::sleep(tokio::time::Duration::from_secs(DELAY_SECS)).await;
+
+        let (up_bal_res, down_bal_res) = tokio::join!(
+            chain_reader::get_ctf_balance(env, up_token_id),
+            chain_reader::get_ctf_balance(env, down_token_id),
+        );
+
+        let up_bal = up_bal_res.unwrap_or(0.0);
+        let down_bal = down_bal_res.unwrap_or(0.0);
+
+        println!(
+            "{}",
+            format!(
+                "[FILL CHECK {}/{}] UP: {:.2}, DOWN: {:.2} (expected ~{:.2} each)",
+                attempt + 1, MAX_ATTEMPTS, up_bal, down_bal, expected_tokens
+            )
+            .bright_black()
+        );
+
+        // Both sufficiently filled → return early
+        if up_bal >= fill_threshold && down_bal >= fill_threshold {
+            return (up_bal, down_bal);
+        }
+    }
+
+    // Final attempt balances (re-read to avoid returning stale 0s)
+    let up_final = chain_reader::get_ctf_balance(env, up_token_id).await.unwrap_or(0.0);
+    let down_final = chain_reader::get_ctf_balance(env, down_token_id).await.unwrap_or(0.0);
+    (up_final, down_final)
+}
+
+/// Attempt to unwind a single filled leg when the other side didn't fill.
+async fn attempt_unwind_after_partial_fill(
+    clob_client: &Arc<ClobClient>,
     env: &Env,
     up_token_id: &str,
     down_token_id: &str,
     up_result: &ArbitrageOrderResult,
     down_result: &ArbitrageOrderResult,
+    up_filled: bool,
+    down_filled: bool,
+    up_actual: f64,
+    down_actual: f64,
 ) {
-    // Short delay to let on-chain state settle after CLOB fill
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-    let up_balance = chain_reader::get_ctf_balance(env, up_token_id).await;
-    let down_balance = chain_reader::get_ctf_balance(env, down_token_id).await;
-
-    match (up_balance, down_balance) {
-        (Ok(up_bal), Ok(down_bal)) => {
-            let expected_up = if up_result.success { up_result.tokens_bought.unwrap_or(0.0) } else { 0.0 };
-            let expected_down = if down_result.success { down_result.tokens_bought.unwrap_or(0.0) } else { 0.0 };
+    if up_filled && !down_filled {
+        // UP filled but DOWN didn't → sell UP tokens
+        let size = floor_to_decimals(up_actual, TOKEN_DECIMALS);
+        if size >= MIN_TOKEN_AMOUNT {
+            let unwind_price = compute_unwind_price(up_result.price, env.max_unwind_slippage);
             println!(
                 "{}",
                 format!(
-                    "[VERIFY] On-chain CTF balances — UP: {:.2} (expected ~{:.2}), DOWN: {:.2} (expected ~{:.2})",
-                    up_bal, expected_up, down_bal, expected_down
+                    "Attempting to unwind UP leg... (sell {:.2} @ ${:.4}, max slippage {:.0}%)",
+                    size, unwind_price, env.max_unwind_slippage * 100.0
                 )
-                .bright_black()
+                .yellow()
             );
-            // Alert if there's a significant mismatch (> 1 token difference)
-            if up_result.success && (up_bal - expected_up).abs() > 1.0 {
-                let msg = format!(
-                    "⚠️ POSITION MISMATCH — UP expected ~{:.2}, on-chain {:.2}",
-                    expected_up, up_bal
-                );
-                log_error(&msg, Some("verify_positions"));
-                send_telegram_alert(&msg).await;
-            }
-            if down_result.success && (down_bal - expected_down).abs() > 1.0 {
-                let msg = format!(
-                    "⚠️ POSITION MISMATCH — DOWN expected ~{:.2}, on-chain {:.2}",
-                    expected_down, down_bal
-                );
-                log_error(&msg, Some("verify_positions"));
-                send_telegram_alert(&msg).await;
+            match clob_client.submit_order(up_token_id, OrderSide::Sell, unwind_price, size).await {
+                Ok(_) => {
+                    println!("{}", "✓ UP leg unwound".green());
+                    send_telegram_alert(&format!(
+                        "🔄 Unwound UP leg ({:.2} tokens @ ${:.4})", size, unwind_price
+                    )).await;
+                }
+                Err(e) => {
+                    let msg = format!("⚠️ UNWIND FAILED (UP): {} — {:.2} tokens may remain exposed", e, size);
+                    println!("{}", msg.red());
+                    send_telegram_alert(&msg).await;
+                    log_error(&msg, Some("unwind_up"));
+                }
             }
         }
-        _ => {
+    } else if down_filled && !up_filled {
+        // DOWN filled but UP didn't → sell DOWN tokens
+        let size = floor_to_decimals(down_actual, TOKEN_DECIMALS);
+        if size >= MIN_TOKEN_AMOUNT {
+            let unwind_price = compute_unwind_price(down_result.price, env.max_unwind_slippage);
             println!(
                 "{}",
-                "[VERIFY] Could not query on-chain CTF balances (RPC error)".yellow()
+                format!(
+                    "Attempting to unwind DOWN leg... (sell {:.2} @ ${:.4}, max slippage {:.0}%)",
+                    size, unwind_price, env.max_unwind_slippage * 100.0
+                )
+                .yellow()
             );
+            match clob_client.submit_order(down_token_id, OrderSide::Sell, unwind_price, size).await {
+                Ok(_) => {
+                    println!("{}", "✓ DOWN leg unwound".green());
+                    send_telegram_alert(&format!(
+                        "🔄 Unwound DOWN leg ({:.2} tokens @ ${:.4})", size, unwind_price
+                    )).await;
+                }
+                Err(e) => {
+                    let msg = format!("⚠️ UNWIND FAILED (DOWN): {} — {:.2} tokens may remain exposed", e, size);
+                    println!("{}", msg.red());
+                    send_telegram_alert(&msg).await;
+                    log_error(&msg, Some("unwind_down"));
+                }
+            }
         }
+    }
+
+    // Log post-reconciliation USDC balance
+    if let Ok(bal) = chain_reader::get_usdc_balance(env).await {
+        println!(
+            "{}",
+            format!("[RECONCILE] Post-unwind USDC.e balance: ${:.2}", bal).bright_black()
+        );
     }
 }
