@@ -10,6 +10,10 @@ pub struct VelocityLockout {
     lockout_until: i64,
     lockout_ms: i64,
     last_lockout_log_ms: i64,
+    /// Number of profitable opportunities blocked by velocity lockout
+    pub blocked_count: u64,
+    /// Total net spread value of blocked opportunities (sum of $ missed)
+    pub blocked_spread_total: f64,
 }
 
 impl VelocityLockout {
@@ -21,7 +25,15 @@ impl VelocityLockout {
             lockout_until: 0,
             lockout_ms,
             last_lockout_log_ms: 0,
+            blocked_count: 0,
+            blocked_spread_total: 0.0,
         }
+    }
+
+    /// Record a blocked opportunity for telemetry
+    pub fn record_blocked(&mut self, net_spread: f64) {
+        self.blocked_count += 1;
+        self.blocked_spread_total += net_spread;
     }
 
     /// Record an ask_sum sample and check for rapid movement.

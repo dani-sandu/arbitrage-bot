@@ -17,6 +17,7 @@ pub struct Env {
     pub data_dir: String,
     pub signature_type: String,
     pub max_spread: f64,
+    pub velocity_enabled: bool,
     pub velocity_threshold: f64,
     pub velocity_lockout_secs: i64,
     pub max_unwind_slippage: f64,
@@ -66,6 +67,10 @@ impl Env {
                 .unwrap_or_else(|_| "0.10".to_string())
                 .parse()
                 .unwrap_or(0.10),
+            velocity_enabled: env::var("VELOCITY_ENABLED")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .unwrap_or(false),
             velocity_threshold: env::var("VELOCITY_THRESHOLD")
                 .unwrap_or_else(|_| "0.15".to_string())
                 .parse()

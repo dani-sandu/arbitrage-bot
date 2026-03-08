@@ -374,8 +374,16 @@ async fn discover_and_monitor(
                         // skip
                     }
                     // === GUARD 2: Velocity lockout ===
-                    else if velocity.lock().await.is_locked() {
-                        println!("{}", "[GUARD] Skipping: velocity lockout active".yellow());
+                    else if env.velocity_enabled && velocity.lock().await.is_locked() {
+                        let mut vel = velocity.lock().await;
+                        vel.record_blocked(net_spread);
+                        println!(
+                            "{}",
+                            format!(
+                                "[GUARD] Skipping: velocity lockout active (blocked {} opps worth ~${:.4} total)",
+                                vel.blocked_count, vel.blocked_spread_total
+                            ).yellow()
+                        );
                     }
                     // === GUARD 3: Spread guard — skip if either side's spread is too wide ===
                     else if price_data.up_spread > env.max_spread || price_data.down_spread > env.max_spread {
