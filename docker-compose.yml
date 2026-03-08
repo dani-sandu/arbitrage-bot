@@ -1,19 +1,78 @@
 services:
-  arbitrage-bot:
+  arb-btc:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: arbitrage-bot
+    container_name: arb-btc
     restart: unless-stopped
     env_file:
       - .env
     environment:
       - RUST_LOG=info
+      - MARKET_ASSET=BTC
+      - DATA_DIR=/app/data/btc
     dns:
       - 8.8.8.8
       - 1.1.1.1
     volumes:
-      - arbitrage-bot-data:/app/data
+      - arb-btc-data:/app/data/btc
+
+  arb-eth:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: arb-eth
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - RUST_LOG=info
+      - MARKET_ASSET=ETH
+      - DATA_DIR=/app/data/eth
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    volumes:
+      - arb-eth-data:/app/data/eth
+
+  arb-sol:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: arb-sol
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - RUST_LOG=info
+      - MARKET_ASSET=SOL
+      - DATA_DIR=/app/data/sol
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    volumes:
+      - arb-sol-data:/app/data/sol
+
+  arb-xrp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: arb-xrp
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - RUST_LOG=info
+      - MARKET_ASSET=XRP
+      - DATA_DIR=/app/data/xrp
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    volumes:
+      - arb-xrp-data:/app/data/xrp
 
 volumes:
-  arbitrage-bot-data:
+  arb-btc-data:
+  arb-eth-data:
+  arb-sol-data:
+  arb-xrp-data:

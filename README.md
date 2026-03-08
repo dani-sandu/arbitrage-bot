@@ -119,7 +119,9 @@ SIGNATURE_TYPE=EOA          # EOA or GNOSIS_SAFE
 RPC_URL=https://polygon-rpc.com
 
 # ── Asset ───────────────────────────────────────────────────────────────────
-MARKET_ASSET=BTC            # BTC | ETH | SOL | XRP
+# MARKET_ASSET is set per-container in docker-compose.yml.
+# Only set this here if you are running a single container manually.
+# MARKET_ASSET=BTC          # BTC | ETH | SOL | XRP
 
 # ── Strategy ────────────────────────────────────────────────────────────────
 TOKEN_AMOUNT=5.0            # Tokens to buy per side (min: 5.0)
@@ -145,36 +147,59 @@ DATA_DIR=/app/data          # Persist logs and state via Docker volume
 
 ## Running
 
-### Start (detached)
+### Start all markets (detached)
 
 ```bash
-docker-compose up arbitrage-bot -d --build
+docker-compose up -d --build
+```
+
+### Start a single market
+
+```bash
+docker-compose up -d --build arb-btc
 ```
 
 ### View live logs
 
 ```bash
-docker-compose logs -f arbitrage-bot
+# All containers
+docker-compose logs -f
+
+# Specific market
+docker-compose logs -f arb-eth
 ```
 
 ### Stop
 
 ```bash
+# All markets
 docker-compose down
+
+# Single market
+docker-compose stop arb-sol
 ```
 
 ### Rebuild after code changes
 
 ```bash
-docker-compose build arbitrage-bot
-docker-compose up arbitrage-bot -d
+docker-compose build
+docker-compose up -d
 ```
 
 ---
 
 ## Data & Logs
 
-The bot writes to a named Docker volume (`arbitrage-bot-data`) mounted at `/app/data`:
+Each container writes to its own named Docker volume, mounted at `/app/data/<asset>`:
+
+| Volume | Mount path | Container |
+|--------|------------|-----------|
+| `arb-btc-data` | `/app/data/btc` | `arb-btc` |
+| `arb-eth-data` | `/app/data/eth` | `arb-eth` |
+| `arb-sol-data` | `/app/data/sol` | `arb-sol` |
+| `arb-xrp-data` | `/app/data/xrp` | `arb-xrp` |
+
+Each volume contains:
 
 | File | Contents |
 |------|----------|
@@ -182,11 +207,11 @@ The bot writes to a named Docker volume (`arbitrage-bot-data`) mounted at `/app/
 | `monitor.log` | Rolling market monitor output |
 | `error.log` | Error and warning entries |
 
-To inspect the volume from the host:
+To inspect a volume from the host:
 
 ```bash
-docker-compose exec arbitrage-bot cat /app/data/state.json
-docker-compose exec arbitrage-bot tail -f /app/data/monitor.log
+docker-compose exec arb-btc cat /app/data/btc/state.json
+docker-compose exec arb-eth tail -f /app/data/eth/monitor.log
 ```
 
 ---
