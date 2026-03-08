@@ -1,0 +1,19 @@
+services:
+  arbitrage-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: arbitrage-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - RUST_LOG=info
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    volumes:
+      - arbitrage-bot-data:/app/data
+
+volumes:
+  arbitrage-bot-data:
