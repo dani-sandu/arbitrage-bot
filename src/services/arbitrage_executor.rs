@@ -14,6 +14,8 @@ const MIN_TOKEN_AMOUNT: f64 = 5.0;
 pub const MIN_NET_SPREAD: f64 = 0.005;
 // Absolute floor price for unwind sells (never go below this)
 const UNWIND_PRICE_FLOOR: f64 = 0.01;
+// Absolute ceiling for buy price buffer (never exceed the complement price)
+const MAX_BUFFERED_PRICE: f64 = 0.99;
 
 #[derive(Debug, Clone)]
 pub struct ArbitrageOrderResult {
@@ -180,8 +182,24 @@ pub async fn execute_arbitrage_trade(
             env.token_amount, available_up, available_down, MIN_TOKEN_AMOUNT
         ));
     }
-    let up_usdc = floor_to_decimals(token_amount * up_price, PRICE_DECIMALS);
-    let down_usdc = floor_to_decimals(token_amount * down_price, PRICE_DECIMALS);
+    // Apply price buffer to improve fill probability
+    // The buffer adds a small amount above the ask price so our limit order
+    // is more likely to match against resting asks even if they shifted slightly.
+    let buffered_up_price = (up_price + env.buy_price_buffer).min(MAX_BUFFERED_PRICE);
+    let buffered_down_price = (down_price + env.buy_price_buffer).min(MAX_BUFFERED_PRICE);
+
+    // Re-check profitability with buffered prices
+    let buffered_ask_sum = buffered_up_price + buffered_down_price;
+    let (net_spread, profitable) = check_profitability(buffered_ask_sum, env.arbitrage_threshold, env.taker_fee_rate);
+    if !profitable {
+        return Err(anyhow!(
+            "Not profitable after price buffer: buffered sum {:.4} (buffer {:.2}¢ each), net spread {:.4}",
+            buffered_ask_sum, env.buy_price_buffer * 100.0, net_spread
+        ));
+    }
+
+    let up_usdc = floor_to_decimals(token_amount * buffered_up_price, PRICE_DECIMALS);
+    let down_usdc = floor_to_decimals(token_amount * buffered_down_price, PRICE_DECIMALS);
 
     if up_usdc < MIN_ORDER_SIZE_USD || down_usdc < MIN_ORDER_SIZE_USD {
         return Err(anyhow!(
@@ -190,37 +208,66 @@ pub async fn execute_arbitrage_trade(
         ));
     }
 
-    // Check profitability after fees
-    let ask_sum = up_price + down_price;
-    let (net_spread, profitable) = check_profitability(ask_sum, env.arbitrage_threshold, env.taker_fee_rate);
-    if !profitable {
-        return Err(anyhow!(
-            "Not profitable after fees: net spread {:.4} (min {:.4})",
-            net_spread, MIN_NET_SPREAD
-        ));
-    }
-
     println!(
         "{}",
         format!(
-            "\n⚡ Executing arbitrage ({:.2} tokens each)\n  UP: ${:.4} → ${:.2} USDC\n  DOWN: ${:.4} → ${:.2} USDC\n  Net spread after fees: {:.4} ({:.2}%)\n",
-            token_amount, up_price, up_usdc, down_price, down_usdc,
-            net_spread, net_spread * 100.0
+            "\n⚡ Executing arbitrage ({:.2} tokens each)\n  UP: ${:.4} (ask ${:.4} + {:.2}¢ buffer) → ${:.2} USDC\n  DOWN: ${:.4} (ask ${:.4} + {:.2}¢ buffer) → ${:.2} USDC\n  Net spread after fees: {:.4} ({:.2}%)\n  Mode: {}\n",
+            token_amount, buffered_up_price, up_price, env.buy_price_buffer * 100.0, up_usdc,
+            buffered_down_price, down_price, env.buy_price_buffer * 100.0, down_usdc,
+            net_spread, net_spread * 100.0,
+            if env.sequential_execution { "SEQUENTIAL (safer)" } else { "PARALLEL (faster)" }
         )
         .green()
         .bold()
     );
 
-    // Execute both orders in parallel to minimize leg risk
-    let client_up = clob_client.clone();
-    let client_down = clob_client.clone();
-    let up_tid = up_token_id.to_string();
-    let down_tid = down_token_id.to_string();
+    let (up_result, down_result) = if env.sequential_execution {
+        // Sequential mode: execute first leg, verify fill, then execute second leg.
+        // This eliminates one-legged risk entirely.
+        let up_result = execute_buy_order(clob_client, up_token_id, "UP", token_amount, buffered_up_price).await;
 
-    let (up_result, down_result) = tokio::join!(
-        execute_buy_order(&client_up, &up_tid, "UP", token_amount, up_price),
-        execute_buy_order(&client_down, &down_tid, "DOWN", token_amount, down_price),
-    );
+        if !up_result.success {
+            // First leg failed to submit — no risk, just abort
+            let down_result = create_error_result(down_token_id, "DOWN", "Skipped: UP leg failed to submit".to_string());
+            return Ok((up_result, down_result, false));
+        }
+
+        // Verify the UP leg actually filled on-chain before committing to DOWN
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        let up_balance = chain_reader::get_ctf_balance(env, up_token_id).await.unwrap_or(0.0);
+        let fill_threshold = token_amount * 0.5;
+
+        if up_balance < fill_threshold {
+            println!(
+                "{}",
+                format!(
+                    "[SEQUENTIAL] UP leg submitted but not filled on-chain ({:.2}/{:.2}). Aborting DOWN leg.",
+                    up_balance, token_amount
+                ).yellow()
+            );
+            let down_result = create_error_result(down_token_id, "DOWN", "Skipped: UP leg not filled on-chain".to_string());
+            return Ok((up_result, down_result, false));
+        }
+
+        println!(
+            "{}",
+            format!("[SEQUENTIAL] UP leg confirmed on-chain ({:.2} tokens). Executing DOWN leg...", up_balance).green()
+        );
+
+        let down_result = execute_buy_order(clob_client, down_token_id, "DOWN", token_amount, buffered_down_price).await;
+        (up_result, down_result)
+    } else {
+        // Parallel mode: execute both legs simultaneously (original behavior)
+        let client_up = clob_client.clone();
+        let client_down = clob_client.clone();
+        let up_tid = up_token_id.to_string();
+        let down_tid = down_token_id.to_string();
+
+        tokio::join!(
+            execute_buy_order(&client_up, &up_tid, "UP", token_amount, buffered_up_price),
+            execute_buy_order(&client_down, &down_tid, "DOWN", token_amount, buffered_down_price),
+        )
+    };
 
     let both_submitted = up_result.success && down_result.success;
     let mut both_filled = false;
@@ -348,6 +395,63 @@ async fn poll_fill_balances(
     (up_final, down_final)
 }
 
+/// Two-stage unwind: first attempt at configured slippage, then retry at floor price.
+async fn try_unwind_sell(
+    clob_client: &Arc<ClobClient>,
+    token_id: &str,
+    label: &str,
+    size: f64,
+    buy_price: f64,
+    max_slippage: f64,
+) -> bool {
+    // Stage 1: configured slippage
+    let stage1_price = compute_unwind_price(buy_price, max_slippage);
+    println!(
+        "{}",
+        format!(
+            "[UNWIND-1] {} sell {:.2} @ ${:.4} ({:.0}% slippage)",
+            label, size, stage1_price, max_slippage * 100.0
+        ).yellow()
+    );
+    match clob_client.submit_order(token_id, OrderSide::Sell, stage1_price, size).await {
+        Ok(_) => {
+            println!("{}", format!("✓ {} leg unwound (stage 1)", label).green());
+            send_telegram_alert(&format!(
+                "🔄 Unwound {} leg ({:.2} tokens @ ${:.4})", label, size, stage1_price
+            )).await;
+            return true;
+        }
+        Err(e) => {
+            println!("{}", format!("✗ Stage 1 unwind failed: {}", e).red());
+        }
+    }
+
+    // Stage 2: emergency sell at floor price ($0.01) to exit at any cost
+    println!(
+        "{}",
+        format!(
+            "[UNWIND-2] {} emergency sell {:.2} @ ${:.4} (floor price)",
+            label, size, UNWIND_PRICE_FLOOR
+        ).red().bold()
+    );
+    match clob_client.submit_order(token_id, OrderSide::Sell, UNWIND_PRICE_FLOOR, size).await {
+        Ok(_) => {
+            println!("{}", format!("✓ {} leg unwound (stage 2 — emergency)", label).green());
+            send_telegram_alert(&format!(
+                "🚨 Emergency unwind {} ({:.2} tokens @ ${:.4})", label, size, UNWIND_PRICE_FLOOR
+            )).await;
+            return true;
+        }
+        Err(e) => {
+            let msg = format!("⚠️ UNWIND FAILED ({}): {} — {:.2} tokens remain exposed", label, e, size);
+            println!("{}", msg.red());
+            send_telegram_alert(&msg).await;
+            log_error(&msg, Some(&format!("unwind_{}", label.to_lowercase())));
+            return false;
+        }
+    }
+}
+
 /// Attempt to unwind a single filled leg when the other side didn't fill.
 async fn attempt_unwind_after_partial_fill(
     clob_client: &Arc<ClobClient>,
@@ -355,67 +459,27 @@ async fn attempt_unwind_after_partial_fill(
     up_token_id: &str,
     down_token_id: &str,
     up_result: &ArbitrageOrderResult,
-    down_result: &ArbitrageOrderResult,
+    _down_result: &ArbitrageOrderResult,
     up_filled: bool,
     down_filled: bool,
     up_actual: f64,
     down_actual: f64,
 ) {
     if up_filled && !down_filled {
-        // UP filled but DOWN didn't → sell UP tokens
         let size = floor_to_decimals(up_actual, TOKEN_DECIMALS);
         if size >= MIN_TOKEN_AMOUNT {
-            let unwind_price = compute_unwind_price(up_result.price, env.max_unwind_slippage);
-            println!(
-                "{}",
-                format!(
-                    "Attempting to unwind UP leg... (sell {:.2} @ ${:.4}, max slippage {:.0}%)",
-                    size, unwind_price, env.max_unwind_slippage * 100.0
-                )
-                .yellow()
-            );
-            match clob_client.submit_order(up_token_id, OrderSide::Sell, unwind_price, size).await {
-                Ok(_) => {
-                    println!("{}", "✓ UP leg unwound".green());
-                    send_telegram_alert(&format!(
-                        "🔄 Unwound UP leg ({:.2} tokens @ ${:.4})", size, unwind_price
-                    )).await;
-                }
-                Err(e) => {
-                    let msg = format!("⚠️ UNWIND FAILED (UP): {} — {:.2} tokens may remain exposed", e, size);
-                    println!("{}", msg.red());
-                    send_telegram_alert(&msg).await;
-                    log_error(&msg, Some("unwind_up"));
-                }
-            }
+            try_unwind_sell(
+                clob_client, up_token_id, "UP", size,
+                up_result.price, env.max_unwind_slippage,
+            ).await;
         }
     } else if down_filled && !up_filled {
-        // DOWN filled but UP didn't → sell DOWN tokens
         let size = floor_to_decimals(down_actual, TOKEN_DECIMALS);
         if size >= MIN_TOKEN_AMOUNT {
-            let unwind_price = compute_unwind_price(down_result.price, env.max_unwind_slippage);
-            println!(
-                "{}",
-                format!(
-                    "Attempting to unwind DOWN leg... (sell {:.2} @ ${:.4}, max slippage {:.0}%)",
-                    size, unwind_price, env.max_unwind_slippage * 100.0
-                )
-                .yellow()
-            );
-            match clob_client.submit_order(down_token_id, OrderSide::Sell, unwind_price, size).await {
-                Ok(_) => {
-                    println!("{}", "✓ DOWN leg unwound".green());
-                    send_telegram_alert(&format!(
-                        "🔄 Unwound DOWN leg ({:.2} tokens @ ${:.4})", size, unwind_price
-                    )).await;
-                }
-                Err(e) => {
-                    let msg = format!("⚠️ UNWIND FAILED (DOWN): {} — {:.2} tokens may remain exposed", e, size);
-                    println!("{}", msg.red());
-                    send_telegram_alert(&msg).await;
-                    log_error(&msg, Some("unwind_down"));
-                }
-            }
+            try_unwind_sell(
+                clob_client, down_token_id, "DOWN", size,
+                up_result.price, env.max_unwind_slippage,
+            ).await;
         }
     }
 

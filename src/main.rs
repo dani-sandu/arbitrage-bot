@@ -399,12 +399,23 @@ async fn discover_and_monitor(
                             .yellow()
                         );
                     }
+                    // === GUARD 5: Book depth — require minimum ask levels to avoid phantom liquidity ===
+                    else if price_data.up_ask_depth < env.min_book_depth || price_data.down_ask_depth < env.min_book_depth {
+                        println!(
+                            "{}",
+                            format!(
+                                "[GUARD] Skipping: shallow orderbook (UP: {} levels, DOWN: {} levels, min: {})",
+                                price_data.up_ask_depth, price_data.down_ask_depth, env.min_book_depth
+                            )
+                            .yellow()
+                        );
+                    }
                     else {
                         // All guards passed — attempt trade
                         let opportunity_key = market.slug.clone();
                         let is_market_open = time_until_end > 5000;
 
-                        // === GUARD 5: Persistent state — check if already traded this market ===
+                        // === GUARD 6: Persistent state — check if already traded this market ===
                         let already_traded = persistent_state.lock().await.was_traded(&opportunity_key);
 
                         let client_arc = {

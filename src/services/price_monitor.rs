@@ -26,6 +26,10 @@ pub struct PriceData {
     pub up_spread: f64,
     /// Individual spread for down side (down_ask - down_bid)
     pub down_spread: f64,
+    /// Number of ask levels in the UP orderbook
+    pub up_ask_depth: usize,
+    /// Number of ask levels in the DOWN orderbook
+    pub down_ask_depth: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +73,9 @@ pub fn create_price_data(
         .map(|a| a.size)
         .unwrap_or(0.0);
 
+    let up_ask_depth = up_snapshot.map(|s| s.asks.len()).unwrap_or(0);
+    let down_ask_depth = down_snapshot.map(|s| s.asks.len()).unwrap_or(0);
+
     let up_spread = if up_ask > 0.0 && up_bid > 0.0 { up_ask - up_bid } else { 0.0 };
     let down_spread = if down_ask > 0.0 && down_bid > 0.0 { down_ask - down_bid } else { 0.0 };
 
@@ -92,6 +99,8 @@ pub fn create_price_data(
         down_ask_size,
         up_spread,
         down_spread,
+        up_ask_depth,
+        down_ask_depth,
     }
 }
 

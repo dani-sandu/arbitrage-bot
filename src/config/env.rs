@@ -20,6 +20,9 @@ pub struct Env {
     pub velocity_threshold: f64,
     pub velocity_lockout_secs: i64,
     pub max_unwind_slippage: f64,
+    pub buy_price_buffer: f64,
+    pub min_book_depth: usize,
+    pub sequential_execution: bool,
     pub socks5_proxy_url: Option<String>,
 }
 
@@ -72,9 +75,21 @@ impl Env {
                 .parse()
                 .unwrap_or(5),
             max_unwind_slippage: env::var("MAX_UNWIND_SLIPPAGE")
-                .unwrap_or_else(|_| "0.10".to_string())
+                .unwrap_or_else(|_| "0.50".to_string())
                 .parse()
-                .unwrap_or(0.10),
+                .unwrap_or(0.50),
+            buy_price_buffer: env::var("BUY_PRICE_BUFFER")
+                .unwrap_or_else(|_| "0.01".to_string())
+                .parse()
+                .unwrap_or(0.01),
+            min_book_depth: env::var("MIN_BOOK_DEPTH")
+                .unwrap_or_else(|_| "2".to_string())
+                .parse()
+                .unwrap_or(2),
+            sequential_execution: env::var("SEQUENTIAL_EXECUTION")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .unwrap_or(false),
             socks5_proxy_url: env::var("SOCKS5_PROXY_URL").ok().filter(|s| !s.is_empty()),
         }
     }
