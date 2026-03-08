@@ -11,6 +11,7 @@ services:
       - RUST_LOG=info
       - MARKET_ASSET=BTC
       - DATA_DIR=/app/data/btc
+      - HTTPS_PROXY=${SOCKS5_PROXY_URL:-}
     dns:
       - 8.8.8.8
       - 1.1.1.1
@@ -29,6 +30,7 @@ services:
       - RUST_LOG=info
       - MARKET_ASSET=ETH
       - DATA_DIR=/app/data/eth
+      - HTTPS_PROXY=${SOCKS5_PROXY_URL:-}
     dns:
       - 8.8.8.8
       - 1.1.1.1
@@ -47,6 +49,7 @@ services:
       - RUST_LOG=info
       - MARKET_ASSET=SOL
       - DATA_DIR=/app/data/sol
+      - HTTPS_PROXY=${SOCKS5_PROXY_URL:-}
     dns:
       - 8.8.8.8
       - 1.1.1.1
@@ -65,6 +68,7 @@ services:
       - RUST_LOG=info
       - MARKET_ASSET=XRP
       - DATA_DIR=/app/data/xrp
+      - HTTPS_PROXY=${SOCKS5_PROXY_URL:-}
     dns:
       - 8.8.8.8
       - 1.1.1.1

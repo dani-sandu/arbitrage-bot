@@ -143,7 +143,8 @@ DATA_DIR=/app/data          # Persist logs and state via Docker volume
 # ── SOCKS5 Proxy (optional) ─────────────────────────────────────────────────
 # Routes CLOB order calls through a SOCKS5 proxy to bypass regional restrictions.
 # Only affects order placement — WebSocket, Gamma API, and RPC calls are direct.
-# SOCKS5_PROXY_URL=socks5://user:pass@host:port
+# Use socks5h:// (not socks5://) so DNS is resolved on the proxy side.
+# SOCKS5_PROXY_URL=socks5h://user:pass@host:port
 ```
 
 > **Security**: Never commit your `.env` file. It contains your private key.
@@ -241,7 +242,7 @@ docker-compose exec arb-eth tail -f /app/data/eth/monitor.log
 | `DATA_DIR` | `./data` | Directory for logs and state file |
 | `TELEGRAM_BOT_TOKEN` | _(empty)_ | Telegram bot token (optional) |
 | `TELEGRAM_CHAT_ID` | _(empty)_ | Telegram chat ID (optional) |
-| `SOCKS5_PROXY_URL` | _(empty)_ | SOCKS5 proxy for CLOB order calls (e.g. `socks5://user:pass@host:port`) |
+| `SOCKS5_PROXY_URL` | _(empty)_ | SOCKS5 proxy for CLOB order calls (e.g. `socks5h://user:pass@host:port`) |
 
 ---
 

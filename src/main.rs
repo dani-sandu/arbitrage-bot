@@ -32,12 +32,41 @@ fn mask_proxy_url(url: &str) -> String {
     url.to_string()
 }
 
+/// Test SOCKS5 proxy connectivity by making a simple GET through it.
+async fn test_socks5_proxy(proxy_url: &str) -> anyhow::Result<()> {
+    let proxy = reqwest::Proxy::all(proxy_url)
+        .map_err(|e| anyhow::anyhow!("Invalid proxy URL: {}", e))?;
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build proxy client: {}", e))?;
+    client
+        .get("https://clob.polymarket.com/time")
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let env = Env::load();
 
     if let Some(ref proxy_url) = env.socks5_proxy_url {
         println!("{}", format!("🌐 SOCKS5 proxy configured for CLOB orders: {}", mask_proxy_url(proxy_url)).cyan());
+        // Quick connectivity test through the proxy
+        match test_socks5_proxy(proxy_url).await {
+            Ok(_) => println!("{}", "  ✓ Proxy connectivity OK".green()),
+            Err(e) => println!("{}", format!("  ⚠️  Proxy test failed: {}. CLOB client may fail to initialize.", e).yellow()),
+        }
+    } else if std::env::var("HTTPS_PROXY").ok().filter(|s| !s.is_empty()).is_some() {
+        let proxy_val = std::env::var("HTTPS_PROXY").unwrap();
+        println!("{}", format!("🌐 HTTPS_PROXY detected for CLOB orders: {}", mask_proxy_url(&proxy_val)).cyan());
+        match test_socks5_proxy(&proxy_val).await {
+            Ok(_) => println!("{}", "  ✓ Proxy connectivity OK".green()),
+            Err(e) => println!("{}", format!("  ⚠️  Proxy test failed: {}. CLOB client may fail to initialize.", e).yellow()),
+        }
     }
     
     println!("{}", "\n╔════════════════════════════════════════════════════════════════╗".cyan().bold());
@@ -217,11 +246,6 @@ async fn discover_and_monitor(
         let mut client_guard = clob_client.lock().await;
         if client_guard.is_none() {
             println!("{}", "Initializing ClobClient for trading...\n".bright_black());
-            // Set ALL_PROXY before CLOB client creation so the SDK's internal
-            // reqwest::Client routes order calls through the SOCKS5 proxy.
-            if let Some(ref proxy_url) = env.socks5_proxy_url {
-                std::env::set_var("ALL_PROXY", proxy_url);
-            }
             match services::create_clob_client::create_clob_client(env).await {
                 Ok(client) => {
                     *client_guard = Some(Arc::new(client));
