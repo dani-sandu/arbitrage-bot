@@ -17,9 +17,28 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 
+/// Mask credentials in a proxy URL for safe logging.
+fn mask_proxy_url(url: &str) -> String {
+    if let Ok(parsed) = url::Url::parse(url) {
+        if parsed.username() != "" || parsed.password().is_some() {
+            let host_port = if let Some(port) = parsed.port() {
+                format!("{}:{}", parsed.host_str().unwrap_or("?"), port)
+            } else {
+                parsed.host_str().unwrap_or("?").to_string()
+            };
+            return format!("{}://***:***@{}", parsed.scheme(), host_port);
+        }
+    }
+    url.to_string()
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let env = Env::load();
+
+    if let Some(ref proxy_url) = env.socks5_proxy_url {
+        println!("{}", format!("🌐 SOCKS5 proxy configured for CLOB orders: {}", mask_proxy_url(proxy_url)).cyan());
+    }
     
     println!("{}", "\n╔════════════════════════════════════════════════════════════════╗".cyan().bold());
     println!("{}", "║     Polymarket Arbitrage Bot - 15-Minute Market Monitor       ║".cyan().bold());
@@ -32,8 +51,9 @@ async fn main() -> anyhow::Result<()> {
     let selected_coin = env.market_asset.clone();
 
     let startup_msg = format!(
-        "🚀 Arbitrage Bot Started!\nAsset: {}\nThreshold: {}\nToken Amount: {}",
-        selected_coin, env.arbitrage_threshold, env.token_amount
+        "🚀 Arbitrage Bot Started!\nAsset: {}\nThreshold: {}\nToken Amount: {}\nProxy: {}",
+        selected_coin, env.arbitrage_threshold, env.token_amount,
+        if env.socks5_proxy_url.is_some() { "SOCKS5" } else { "none" }
     );
     send_telegram_alert(&startup_msg).await;
 
@@ -197,6 +217,11 @@ async fn discover_and_monitor(
         let mut client_guard = clob_client.lock().await;
         if client_guard.is_none() {
             println!("{}", "Initializing ClobClient for trading...\n".bright_black());
+            // Set ALL_PROXY before CLOB client creation so the SDK's internal
+            // reqwest::Client routes order calls through the SOCKS5 proxy.
+            if let Some(ref proxy_url) = env.socks5_proxy_url {
+                std::env::set_var("ALL_PROXY", proxy_url);
+            }
             match services::create_clob_client::create_clob_client(env).await {
                 Ok(client) => {
                     *client_guard = Some(Arc::new(client));

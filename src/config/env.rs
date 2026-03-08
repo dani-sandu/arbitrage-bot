@@ -20,6 +20,7 @@ pub struct Env {
     pub velocity_threshold: f64,
     pub velocity_lockout_secs: i64,
     pub max_unwind_slippage: f64,
+    pub socks5_proxy_url: Option<String>,
 }
 
 impl Env {
@@ -74,6 +75,7 @@ impl Env {
                 .unwrap_or_else(|_| "0.10".to_string())
                 .parse()
                 .unwrap_or(0.10),
+            socks5_proxy_url: env::var("SOCKS5_PROXY_URL").ok().filter(|s| !s.is_empty()),
         }
     }
 }
