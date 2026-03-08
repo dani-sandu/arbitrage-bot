@@ -214,6 +214,58 @@ docker-compose exec arbitrage-bot tail -f /app/data/monitor.log
 
 ---
 
+## Position Redeemer
+
+The `redeemer/` service is a standalone Rust tool that automatically redeems all resolved Polymarket positions for your wallet, converting outcome tokens back to USDC.e.
+
+### How it works
+
+1. **Fetch positions** — queries `data-api.polymarket.com/positions` for all token positions linked to your wallet
+2. **Check on-chain balances** — queries the CTF (ERC-1155) contract on Polygon for the actual token balance of each position
+3. **Check resolution** — queries the Gamma API to confirm which markets are resolved and whether they are NegRisk or standard CTF markets
+4. **Simulate before sending** — runs `eth_call` simulation for every redemption before broadcasting, so no gas is wasted on a revert
+5. **Redeem** — calls the correct contract:
+   - Standard markets → `CTF.redeemPositions(collateral, parentCollectionId, conditionId, indexSets)`
+   - NegRisk markets → `NegRiskAdapter.redeemPositions(conditionId, indexSets)`
+   - Falls back automatically if the primary choice reverts in simulation
+
+Both the winning and losing token for each market are redeemed in a single transaction. Only the winning side pays out $1.00 per token; the losing side returns $0.00.
+
+### Running the redeemer
+
+**Dry run** (default — no transactions sent):
+
+```bash
+docker-compose -f docker-compose.redeemer.yml run --rm redeemer
+```
+
+**Live run** (executes on-chain redemptions):
+
+```bash
+docker-compose -f docker-compose.redeemer.yml run --rm -e DRY_RUN=false redeemer
+```
+
+### Environment variables
+
+The redeemer reads the same `.env` file as the arbitrage bot. The relevant variables are:
+
+| Variable | Description |
+|----------|-------------|
+| `PRIVATE_KEY` | EOA private key used to sign redemption transactions |
+| `PROXY_WALLET` | Wallet address whose positions are fetched and redeemed |
+| `RPC_URL` | Polygon RPC endpoint (e.g. Alchemy) |
+| `DRY_RUN` | `true` (default) — print what would be redeemed without sending txs |
+
+### Contracts used
+
+| Contract | Address | Purpose |
+|----------|---------|---------|
+| CTF (Conditional Tokens) | `0x4D97DCd97eC945f40cF65F87097ACe5EA0476045` | ERC-1155 token contract; direct redemption target for standard markets |
+| NegRisk Adapter | `0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296` | Redemption target for NegRisk markets |
+| USDC.e | `0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174` | Collateral token paid out on redemption |
+
+---
+
 ## Architecture
 
 ```
@@ -238,6 +290,12 @@ src/
     ├── telegram.rs          # Telegram alert integration
     ├── keyboard.rs          # Terminal keyboard input
     └── coin_selector.rs     # Coin selection helpers
+
+redeemer/
+├── Dockerfile               # Standalone multi-stage build (rust:latest → debian:bookworm-slim)
+├── Cargo.toml               # Dependencies: alloy, reqwest, tokio, serde, colored, hex
+└── src/
+    └── main.rs              # Full redeemer: fetch → balance check → simulate → redeem
 ```
 
 ---

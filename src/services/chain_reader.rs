@@ -61,9 +61,10 @@ pub async fn get_ctf_balance(env: &Env, token_id: &str) -> Result<f64> {
     let token_id_hex = if token_id.starts_with("0x") {
         format!("{:0>64}", token_id.trim_start_matches("0x"))
     } else {
-        // Decimal token ID → convert to hex
-        let id_u128: u128 = token_id.parse().map_err(|_| anyhow!("Invalid token ID"))?;
-        format!("{:0>64x}", id_u128)
+        // Decimal token ID → convert to hex (token IDs are 256-bit, too large for u128)
+        let val = alloy::primitives::U256::from_str_radix(token_id, 10)
+            .map_err(|_| anyhow!("Invalid token ID"))?;
+        format!("{:0>64x}", val)
     };
     let data = format!("{}{}{}", CTF_BALANCE_OF_SELECTOR, pad_address(wallet), token_id_hex);
     let result = rpc_eth_call(&env.rpc_url, CTF_CONTRACT, &data).await?;

@@ -1,0 +1,13 @@
+services:
+  redeemer:
+    build:
+      context: ./redeemer
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      - DRY_RUN=true
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    restart: "no"
