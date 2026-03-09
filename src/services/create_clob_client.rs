@@ -55,9 +55,28 @@ impl ClobClient {
             .await
             .map_err(|e| anyhow!("Order signing failed: {}", e))?;
 
-        let resp = self.client.post_order(signed_order)
-            .await
-            .map_err(|e| anyhow!("Order submission failed: {}", e))?;
+        let resp = match self.client.post_order(signed_order).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                let err_str = format!("{}", e);
+                // FAK orders return 400 when no resting liquidity matches.
+                // This is normal "no fill" behavior, not a submission error.
+                // Return success with no order_id so the on-chain fill check
+                // and retry/unwind flow handles it correctly.
+                if err_str.contains("no orders found to match with FAK order") {
+                    println!(
+                        "{}",
+                        format!("⚠ FAK order found no match (killed): {}", &token_id[..token_id.len().min(20)]).yellow()
+                    );
+                    return Ok(OrderResponse {
+                        success: true,
+                        order_id: None,
+                        error: None,
+                    });
+                }
+                return Err(anyhow!("Order submission failed: {}", e));
+            }
+        };
 
         Ok(OrderResponse {
             success: true,
