@@ -7,12 +7,18 @@ const CTF_CONTRACT: &str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
 // ERC-1155 balanceOf(address,uint256) selector
 const CTF_BALANCE_OF_SELECTOR: &str = "0x00fdd58e";
 
+lazy_static::lazy_static! {
+    // Shared HTTP client — reuses the connection pool across all RPC calls instead of
+    // creating a new TCP connection every time (critical during fill-verification polling).
+    static ref RPC_CLIENT: reqwest::Client = reqwest::Client::new();
+}
+
 fn pad_address(addr: &str) -> String {
     format!("{:0>64}", addr.trim().trim_start_matches("0x").to_lowercase())
 }
 
 async fn rpc_eth_call(rpc_url: &str, to: &str, data: &str) -> Result<String> {
-    let client = reqwest::Client::new();
+    let client = &*RPC_CLIENT;
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "eth_call",

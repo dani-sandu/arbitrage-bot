@@ -6,6 +6,14 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+/// If no WebSocket message is received within this many seconds, the connection
+/// is assumed dead and the reconnect loop will trigger.
+const WS_HEARTBEAT_TIMEOUT_SECS: u64 = 30;
+
+/// Orderbook snapshots older than this are considered stale and will not be
+/// returned to callers — prevents trading on data from a dead/reconnecting WS.
+const STALE_ORDERBOOK_MS: i64 = 10_000;
+
 #[derive(Debug, Clone)]
 pub struct OrderbookLevel {
     pub price: f64,
@@ -20,6 +28,8 @@ pub struct OrderbookSnapshot {
     pub bids: Vec<OrderbookLevel>,
     pub asks: Vec<OrderbookLevel>,
     pub hash: Option<String>,
+    /// Wall-clock time (ms) when this snapshot was received — used for staleness detection.
+    pub received_at: i64,
 }
 
 pub type BookCallback = Arc<dyn Fn(OrderbookSnapshot) + Send + Sync>;
@@ -51,7 +61,12 @@ impl MarketWebSocket {
     }
 
     pub async fn get_orderbook(&self, asset_id: &str) -> Option<OrderbookSnapshot> {
-        self.orderbooks.read().await.get(asset_id).cloned()
+        let snap = self.orderbooks.read().await.get(asset_id).cloned()?;
+        let age_ms = chrono::Utc::now().timestamp_millis() - snap.received_at;
+        if age_ms > STALE_ORDERBOOK_MS {
+            return None;
+        }
+        Some(snap)
     }
 
     fn parse_orderbook_snapshot(data: &serde_json::Value) -> Result<OrderbookSnapshot> {
@@ -90,6 +105,7 @@ impl MarketWebSocket {
             bids,
             asks,
             hash: data.get("hash").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            received_at: chrono::Utc::now().timestamp_millis(),
         })
     }
 
@@ -159,22 +175,32 @@ impl MarketWebSocket {
                         if !*self.is_running.lock().await {
                             break;
                         }
-                        match ws_stream.next().await {
-                            Some(Ok(Message::Text(text))) => {
+                        // Wrap each read with a timeout. If the server goes silent for
+                        // WS_HEARTBEAT_TIMEOUT_SECS, treat the connection as dead and
+                        // let the outer loop reconnect.
+                        match tokio::time::timeout(
+                            tokio::time::Duration::from_secs(WS_HEARTBEAT_TIMEOUT_SECS),
+                            ws_stream.next(),
+                        ).await {
+                            Ok(Some(Ok(Message::Text(text)))) => {
                                 if let Err(e) = self.handle_message(&text).await {
                                     eprintln!("Error handling message: {}", e);
                                 }
                             }
-                            Some(Ok(Message::Ping(data))) => {
+                            Ok(Some(Ok(Message::Ping(data)))) => {
                                 let _ = ws_stream.send(Message::Pong(data)).await;
                             }
-                            Some(Ok(Message::Close(_))) => break,
-                            Some(Err(e)) => {
+                            Ok(Some(Ok(Message::Close(_)))) => break,
+                            Ok(Some(Err(e))) => {
                                 eprintln!("WebSocket error: {}", e);
                                 break;
                             }
-                            None => break,
-                            _ => {}
+                            Ok(None) => break,
+                            Ok(_) => {}
+                            Err(_timeout) => {
+                                eprintln!("WebSocket: no message in {}s — reconnecting", WS_HEARTBEAT_TIMEOUT_SECS);
+                                break;
+                            }
                         }
                     }
                 }

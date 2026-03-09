@@ -106,7 +106,8 @@ fn parse_market_data(coin: &str, market: GammaMarket) -> Result<CoinMarket> {
     })
 }
 
-// Find active 15-min market for coin (IMO: checks current/next/prev windows)
+// Find active 15-min market for coin. Fires all three window lookups in parallel
+// to avoid the worst-case 30-second sequential wait (3 × 10s timeout).
 pub async fn find_15_min_market(coin: &str) -> Result<Option<CoinMarket>> {
     let coin_upper = coin.to_uppercase();
     let prefix = coin_slug(&coin_upper)
@@ -114,39 +115,37 @@ pub async fn find_15_min_market(coin: &str) -> Result<Option<CoinMarket>> {
 
     // Calculate current 15-minute window timestamp (FYI: rounds down to nearest 15min)
     let now = chrono::Utc::now();
-    let minute = (now.minute() / 15) * 15; // Round down to 0, 15, 30, or 45
+    let minute = (now.minute() / 15) * 15;
     let current_window = now
         .date_naive()
         .and_hms_opt(now.hour(), minute, 0)
         .unwrap();
     let current_ts = current_window.and_utc().timestamp();
 
-    // Try current window (AFAIK: most likely to be active)
-    let mut slug = format!("{}-{}", prefix, current_ts);
-    if let Some(market) = get_market_by_slug(&slug).await? {
-        if market.accepting_orders {
-            return Ok(Some(parse_market_data(&coin_upper, market)?));
+    let current_slug = format!("{}-{}", prefix, current_ts);
+    let next_slug    = format!("{}-{}", prefix, current_ts + 900);
+    let prev_slug    = format!("{}-{}", prefix, current_ts - 900);
+
+    // Fire all three requests simultaneously — total time = max(individual latencies)
+    // instead of sum. Priority: current > next > previous.
+    let (r_current, r_next, r_prev) = tokio::join!(
+        get_market_by_slug(&current_slug),
+        get_market_by_slug(&next_slug),
+        get_market_by_slug(&prev_slug),
+    );
+
+    for result in [r_current, r_next, r_prev] {
+        match result {
+            Ok(Some(market)) if market.accepting_orders => {
+                return Ok(Some(parse_market_data(&coin_upper, market)?));
+            }
+            Err(e) => {
+                eprintln!("Market discovery error: {}", e);
+            }
+            _ => {}
         }
     }
 
-    // Try next window (BTW: in case current just ended)
-    let next_ts = current_ts + 900; // 15 minutes = 900 seconds
-    slug = format!("{}-{}", prefix, next_ts);
-    if let Some(market) = get_market_by_slug(&slug).await? {
-        if market.accepting_orders {
-            return Ok(Some(parse_market_data(&coin_upper, market)?));
-        }
-    }
-
-    // Try previous window (FYI: might still be accepting orders)
-    let prev_ts = current_ts - 900;
-    slug = format!("{}-{}", prefix, prev_ts);
-    if let Some(market) = get_market_by_slug(&slug).await? {
-        if market.accepting_orders {
-            return Ok(Some(parse_market_data(&coin_upper, market)?));
-        }
-    }
-
-    Ok(None) // No active market found
+    Ok(None)
 }
 

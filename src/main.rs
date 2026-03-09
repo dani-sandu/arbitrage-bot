@@ -501,6 +501,7 @@ async fn discover_and_monitor(
                                             if still_profitable {
                                                 match services::arbitrage_executor::execute_arbitrage_trade(
                                                     &client,
+                                                    &ws_for_trade,
                                                     &market_trade.up_token_id,
                                                     &market_trade.down_token_id,
                                                     fresh_up,

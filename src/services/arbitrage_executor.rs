@@ -1,6 +1,7 @@
 use crate::config::{Env, MIN_ORDER_SIZE_USD};
 use crate::services::chain_reader;
 use crate::services::create_clob_client::{ClobClient, OrderSide};
+use crate::services::websocket_client::MarketWebSocket;
 use crate::utils::logger::log_error;
 use crate::utils::telegram::send_telegram_alert;
 use anyhow::{anyhow, Result};
@@ -168,6 +169,7 @@ async fn execute_buy_order(
 /// The trade size is capped to the minimum of token_amount, available_up, and available_down.
 pub async fn execute_arbitrage_trade(
     clob_client: &Arc<ClobClient>,
+    ws_ref: &Arc<MarketWebSocket>,
     up_token_id: &str,
     down_token_id: &str,
     up_price: f64,
@@ -398,11 +400,11 @@ pub async fn execute_arbitrage_trade(
             log_error(&fail_detail, Some("fill_verification"));
 
             attempt_unwind_after_partial_fill(
-                clob_client, env,
+                clob_client, ws_ref, env,
                 up_token_id, down_token_id,
                 &up_result, &down_result,
                 up_filled, down_filled,
-                up_actual, down_actual,                market_slug, coin,
+                up_actual, down_actual, market_slug, coin,
                 &mut up_order_ids, &mut down_order_ids, market_end_epoch_ms,
             ).await;
 
@@ -412,7 +414,7 @@ pub async fn execute_arbitrage_trade(
     } else {
         // One order failed to even submit to CLOB — unwind the submitted leg
         attempt_unwind_after_partial_fill(
-            clob_client, env,
+            clob_client, ws_ref, env,
             up_token_id, down_token_id,
             &up_result, &down_result,
             up_result.success, down_result.success,
@@ -550,6 +552,7 @@ async fn try_unwind_sell(
 /// as defense-in-depth.
 async fn retry_unfilled_leg(
     clob_client: &Arc<ClobClient>,
+    ws_ref: &Arc<MarketWebSocket>,
     env: &Env,
     unfilled_token_id: &str,
     label: &str,
@@ -623,16 +626,47 @@ async fn retry_unfilled_leg(
             return true;
         }
 
+        // Use fresh ask price from live orderbook if available; fall back to original.
+        // This is critical when the market has moved since the initial order attempt —
+        // retrying at the stale price will FAK-kill again immediately.
+        let fresh_ask = ws_ref.get_orderbook(unfilled_token_id).await
+            .and_then(|ob| ob.asks.first().map(|a| a.price));
+        let retry_price = match fresh_ask {
+            Some(ask) => {
+                let buffered = (ask + env.buy_price_buffer).min(MAX_BUFFERED_PRICE);
+                if (ask - original_price).abs() > 0.001 {
+                    println!(
+                        "{}",
+                        format!(
+                            "[RETRY {}/{}] {} fresh ask ${:.4} (original ${:.4}) → buffered ${:.4}",
+                            attempt, MAX_RETRIES, label, ask, original_price, buffered
+                        ).yellow()
+                    );
+                }
+                buffered
+            }
+            None => {
+                println!(
+                    "{}",
+                    format!(
+                        "[RETRY {}/{}] {} orderbook unavailable/stale — using original price ${:.4}",
+                        attempt, MAX_RETRIES, label, original_price
+                    ).yellow()
+                );
+                original_price
+            }
+        };
+
         println!(
             "{}",
             format!(
                 "[RETRY {}/{}] Re-submitting {} leg ({:.2} tokens @ ${:.4}, existing: {:.2})...",
-                attempt, MAX_RETRIES, label, remaining, original_price, existing_balance
+                attempt, MAX_RETRIES, label, remaining, retry_price, existing_balance
             ).yellow()
         );
 
         let retry_result = execute_buy_order(
-            clob_client, unfilled_token_id, label, remaining, original_price,
+            clob_client, unfilled_token_id, label, remaining, retry_price,
         ).await;
 
         // Track the new order ID
@@ -672,6 +706,7 @@ async fn retry_unfilled_leg(
 /// Cancels all outstanding orders for the unfilled leg before unwinding.
 async fn attempt_unwind_after_partial_fill(
     clob_client: &Arc<ClobClient>,
+    ws_ref: &Arc<MarketWebSocket>,
     env: &Env,
     up_token_id: &str,
     down_token_id: &str,
@@ -691,7 +726,7 @@ async fn attempt_unwind_after_partial_fill(
         // UP filled, DOWN didn't — retry DOWN first
         let down_size = floor_to_decimals(up_actual, TOKEN_DECIMALS); // match UP's fill
         let retry_ok = retry_unfilled_leg(
-            clob_client, env, down_token_id, "DOWN", down_size, down_result.price,
+            clob_client, ws_ref, env, down_token_id, "DOWN", down_size, down_result.price,
             market_slug, coin, down_order_ids, market_end_epoch_ms,
         ).await;
 
@@ -774,7 +809,7 @@ async fn attempt_unwind_after_partial_fill(
         // DOWN filled, UP didn't — retry UP first
         let up_size = floor_to_decimals(down_actual, TOKEN_DECIMALS); // match DOWN's fill
         let retry_ok = retry_unfilled_leg(
-            clob_client, env, up_token_id, "UP", up_size, up_result.price,
+            clob_client, ws_ref, env, up_token_id, "UP", up_size, up_result.price,
             market_slug, coin, up_order_ids, market_end_epoch_ms,
         ).await;
 
