@@ -153,6 +153,32 @@ async fn main() -> anyhow::Result<()> {
         .bold()
     );
 
+    // Background redeemer: only runs on the instance that has REDEEM_ENABLED=true.
+    if env.redeem_enabled {
+        let env_r = env.clone();
+        tokio::spawn(async move {
+            // Wait 60s after startup before first sweep (let the bot settle).
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            loop {
+                match services::redeemer::run_redemption_sweep(&env_r, env_r.dry_run).await {
+                    Ok(summary) if summary.redeemed > 0 => {
+                        let msg = format!(
+                            "💰 Redeemer: {} position(s) redeemed, +${:.2} USDC{}",
+                            summary.redeemed,
+                            summary.usdc_gained,
+                            if summary.dry_run { " [DRY RUN]" } else { "" },
+                        );
+                        send_telegram_alert(&msg).await;
+                        println!("{}", msg.green());
+                    }
+                    Err(e) => eprintln!("{}", format!("[REDEEMER] Sweep error: {}", e).yellow()),
+                    _ => {}
+                }
+                tokio::time::sleep(Duration::from_secs(env_r.redeem_interval_secs)).await;
+            }
+        });
+    }
+
     tokio::select! {
         result = monitor_market_loop(&selected_coin, &env, &persistent_state) => {
             if let Err(e) = result {

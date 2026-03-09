@@ -12,6 +12,8 @@ services:
       - MARKET_ASSET=BTC
       - DATA_DIR=/app/data/btc
       - HTTPS_PROXY=${SOCKS5_PROXY_URL:-}
+      - REDEEM_ENABLED=true
+      - DRY_RUN=false
     dns:
       - 8.8.8.8
       - 1.1.1.1

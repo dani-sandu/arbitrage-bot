@@ -243,12 +243,15 @@ docker-compose exec arb-eth tail -f /app/data/eth/monitor.log
 | `TELEGRAM_BOT_TOKEN` | _(empty)_ | Telegram bot token (optional) |
 | `TELEGRAM_CHAT_ID` | _(empty)_ | Telegram chat ID (optional) |
 | `SOCKS5_PROXY_URL` | _(empty)_ | SOCKS5 proxy for CLOB order calls (e.g. `socks5h://user:pass@host:port`) |
+| `REDEEM_ENABLED` | `false` | Enable background redeemer on this instance (set on one container only) |
+| `DRY_RUN` | `true` | Redeemer logs actions without sending transactions |
+| `REDEEM_INTERVAL_SECS` | `300` | How often the redeemer sweeps for resolved positions (seconds) |
 
 ---
 
 ## Position Redeemer
 
-The `redeemer/` service is a standalone Rust tool that automatically redeems all resolved Polymarket positions for your wallet, converting outcome tokens back to USDC.e.
+The redeemer runs as a **background task inside the bot** — no separate container or cron job required. On the designated container it wakes up every `REDEEM_INTERVAL_SECS` seconds, sweeps all resolved positions, and redeems them on-chain. A Telegram alert is sent whenever positions are redeemed.
 
 ### How it works
 
@@ -263,30 +266,27 @@ The `redeemer/` service is a standalone Rust tool that automatically redeems all
 
 Both the winning and losing token for each market are redeemed in a single transaction. Only the winning side pays out $1.00 per token; the losing side returns $0.00.
 
-### Running the redeemer
+### Enabling the redeemer
 
-**Dry run** (default — no transactions sent):
+Only **one** container should run the redeemer to avoid redundant transactions. Enable it by setting `REDEEM_ENABLED=true` in the `environment:` block of the chosen service in `docker-compose.yml`:
 
-```bash
-docker-compose -f docker-compose.redeemer.yml run --rm redeemer
+```yaml
+services:
+  arb-btc:
+    environment:
+      - REDEEM_ENABLED=true   # ← only on this service
+      - DRY_RUN=false         # ← send real transactions
 ```
 
-**Live run** (executes on-chain redemptions):
+All other services omit these lines (they default to `REDEEM_ENABLED=false`).
 
-```bash
-docker-compose -f docker-compose.redeemer.yml run --rm -e DRY_RUN=false redeemer
-```
+### Redeemer environment variables
 
-### Environment variables
-
-The redeemer reads the same `.env` file as the arbitrage bot. The relevant variables are:
-
-| Variable | Description |
-|----------|-------------|
-| `PRIVATE_KEY` | EOA private key used to sign redemption transactions |
-| `PROXY_WALLET` | Wallet address whose positions are fetched and redeemed |
-| `RPC_URL` | Polygon RPC endpoint (e.g. Alchemy) |
-| `DRY_RUN` | `true` (default) — print what would be redeemed without sending txs |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REDEEM_ENABLED` | `false` | Enable the background redeemer on this instance |
+| `DRY_RUN` | `true` | Log what would be redeemed without sending transactions |
+| `REDEEM_INTERVAL_SECS` | `300` | Sweep interval in seconds |
 
 ### Contracts used
 
@@ -302,7 +302,7 @@ The redeemer reads the same `.env` file as the arbitrage bot. The relevant varia
 
 ```
 src/
-├── main.rs                  # Entry point, market loop, guard chain, orderbook callback
+├── main.rs                  # Entry point, market loop, guard chain, background redeemer spawn
 ├── config/
 │   ├── env.rs               # Environment variable loading with defaults
 │   ├── constants.rs         # Available coins, API endpoints, order size limits
@@ -314,6 +314,7 @@ src/
 │   ├── arbitrage_executor.rs# Order execution, unwind logic, on-chain verification
 │   ├── approvals.rs         # ERC-20 and CTF approval management
 │   ├── chain_reader.rs      # On-chain balance queries (USDC.e, CTF tokens)
+│   ├── redeemer.rs          # Background redeemer: fetch → balance check → simulate → redeem
 │   ├── persistent_state.rs  # JSON state persistence and trade records
 │   ├── velocity.rs          # Flash-move detection and lockout
 │   └── create_clob_client.rs# Polymarket SDK wrapper (order signing, submission)
@@ -322,12 +323,6 @@ src/
     ├── telegram.rs          # Telegram alert integration
     ├── keyboard.rs          # Terminal keyboard input
     └── coin_selector.rs     # Coin selection helpers
-
-redeemer/
-├── Dockerfile               # Standalone multi-stage build (rust:latest → debian:bookworm-slim)
-├── Cargo.toml               # Dependencies: alloy, reqwest, tokio, serde, colored, hex
-└── src/
-    └── main.rs              # Full redeemer: fetch → balance check → simulate → redeem
 ```
 
 ---

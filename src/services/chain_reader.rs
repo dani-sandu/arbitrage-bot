@@ -13,11 +13,11 @@ lazy_static::lazy_static! {
     static ref RPC_CLIENT: reqwest::Client = reqwest::Client::new();
 }
 
-fn pad_address(addr: &str) -> String {
+pub fn pad_address(addr: &str) -> String {
     format!("{:0>64}", addr.trim().trim_start_matches("0x").to_lowercase())
 }
 
-async fn rpc_eth_call(rpc_url: &str, to: &str, data: &str) -> Result<String> {
+pub async fn rpc_eth_call(rpc_url: &str, to: &str, data: &str) -> Result<String> {
     let client = &*RPC_CLIENT;
     let body = serde_json::json!({
         "jsonrpc": "2.0",
@@ -38,7 +38,7 @@ async fn rpc_eth_call(rpc_url: &str, to: &str, data: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("RPC eth_call failed: {:?}", json.get("error")))
 }
 
-fn parse_uint256_as_f64(hex_result: &str, decimals: u8) -> f64 {
+pub fn parse_uint256_as_f64(hex_result: &str, decimals: u8) -> f64 {
     let hex = hex_result.trim_start_matches("0x");
     if hex.is_empty() || hex.chars().all(|c| c == '0') {
         return 0.0;

@@ -25,6 +25,12 @@ pub struct Env {
     pub min_book_depth: usize,
     pub sequential_execution: bool,
     pub socks5_proxy_url: Option<String>,
+    /// REDEEM_ENABLED: when true this instance runs the background redeemer sweep.
+    pub redeem_enabled: bool,
+    /// DRY_RUN: when true the redeemer logs what it would do but sends no transactions.
+    pub dry_run: bool,
+    /// REDEEM_INTERVAL_SECS: how often the background redeemer sweeps for resolved positions.
+    pub redeem_interval_secs: u64,
 }
 
 impl Env {
@@ -96,6 +102,18 @@ impl Env {
                 .parse()
                 .unwrap_or(false),
             socks5_proxy_url: env::var("SOCKS5_PROXY_URL").ok().filter(|s| !s.is_empty()),
+            redeem_enabled: env::var("REDEEM_ENABLED")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .unwrap_or(false),
+            dry_run: env::var("DRY_RUN")
+                .unwrap_or_else(|_| "true".to_string())
+                .parse()
+                .unwrap_or(true),
+            redeem_interval_secs: env::var("REDEEM_INTERVAL_SECS")
+                .unwrap_or_else(|_| "300".to_string())
+                .parse()
+                .unwrap_or(300),
         }
     }
 }
