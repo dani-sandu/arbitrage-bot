@@ -378,19 +378,23 @@ async fn discover_and_monitor(
                 // Arbitrage detection with fee-aware check
                 // Skip if either side has no asks (price 0.0 = empty orderbook, not a real opportunity)
                 if price_data.up_ask > 0.0 && price_data.down_ask > 0.0 && price_data.ask_sum < env.arbitrage_threshold {
-                    let (net_spread, profitable) = check_profitability(price_data.ask_sum, env.arbitrage_threshold, env.taker_fee_rate);
+                    // Use the buffered ask sum for detection so it matches the pre-execution
+                    // re-check. Without this, opportunities that look profitable on raw asks
+                    // but not after the buffer are detected and immediately rejected.
+                    let buffered_ask_sum = price_data.ask_sum + env.buy_price_buffer * 2.0;
+                    let (net_spread, profitable) = check_profitability(buffered_ask_sum, env.arbitrage_threshold, env.taker_fee_rate);
 
                     let mut monitor_guard = monitor.lock().await;
                     monitor_guard.record_arbitrage(&coin, &price_data);
                     drop(monitor_guard);
 
-                    let gross_spread = (env.arbitrage_threshold - price_data.ask_sum) * 100.0;
+                    let gross_spread = (env.arbitrage_threshold - buffered_ask_sum) * 100.0;
                     let timestamp = chrono::Utc::now().format("%H:%M:%S");
                     println!(
                         "{}",
                         format!(
-                            "\n⚡ [{}] ARBITRAGE DETECTED - {}\n   UP_ASK: {:.4} + DOWN_ASK: {:.4} = {:.4}\n   Gross: {:.2}% | Net after fees: {:.4}\n   {}",
-                            timestamp, coin, price_data.up_ask, price_data.down_ask, price_data.ask_sum, gross_spread, net_spread,
+                            "\n⚡ [{}] ARBITRAGE DETECTED - {}\n   UP_ASK: {:.4} + DOWN_ASK: {:.4} = {:.4} (raw) / {:.4} (buffered)\n   Gross: {:.2}% | Net after fees: {:.4}\n   {}",
+                            timestamp, coin, price_data.up_ask, price_data.down_ask, price_data.ask_sum, buffered_ask_sum, gross_spread, net_spread,
                             if profitable { "✓ PROFITABLE" } else { "✗ Not profitable after fees" }
                         )
                         .green()
