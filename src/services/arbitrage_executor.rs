@@ -165,6 +165,7 @@ pub async fn execute_arbitrage_trade(
     env: &Env,
     market_slug: &str,
     coin: &str,
+    market_end_epoch_ms: i64,
 ) -> Result<(ArbitrageOrderResult, ArbitrageOrderResult, bool)> {
     if up_token_id.trim().is_empty() || down_token_id.trim().is_empty() {
         return Err(anyhow!("Invalid token IDs"));
@@ -275,6 +276,10 @@ pub async fn execute_arbitrage_trade(
     let both_submitted = up_result.success && down_result.success;
     let mut both_filled = false;
 
+    // Track order IDs for cancellation during retry/unwind
+    let mut up_order_ids: Vec<String> = up_result.order_id.iter().cloned().collect();
+    let mut down_order_ids: Vec<String> = down_result.order_id.iter().cloned().collect();
+
     if both_submitted {
         // Both orders accepted by CLOB — verify actual fills on-chain before celebrating.
         // FAK orders can be accepted but not filled if liquidity disappeared.
@@ -323,7 +328,9 @@ pub async fn execute_arbitrage_trade(
                 up_token_id, down_token_id,
                 &up_result, &down_result,
                 up_filled, down_filled,
-                up_actual, down_actual,                market_slug, coin,            ).await;
+                up_actual, down_actual,                market_slug, coin,
+                &mut up_order_ids, &mut down_order_ids, market_end_epoch_ms,
+            ).await;
 
             let msg = format!("⚠️ ARBITRAGE FILL FAILED\n📊 {} | {}\n{}", coin, market_slug, fail_detail);
             send_telegram_alert(&msg).await;
@@ -338,6 +345,7 @@ pub async fn execute_arbitrage_trade(
             if up_result.success { up_result.tokens_bought.unwrap_or(0.0) } else { 0.0 },
             if down_result.success { down_result.tokens_bought.unwrap_or(0.0) } else { 0.0 },
             market_slug, coin,
+            &mut up_order_ids, &mut down_order_ids, market_end_epoch_ms,
         ).await;
 
         let error_msg = format!(
@@ -461,10 +469,11 @@ async fn try_unwind_sell(
 /// Attempt to retry the unfilled leg before resorting to unwind.
 /// Returns true if the retry succeeded and both legs are now filled.
 ///
-/// SAFETY: Before each retry, we check the on-chain balance to see if
-/// previous orders already filled (settlement can lag behind CLOB execution).
-/// This prevents accumulating 2-3× the intended position when FAK orders
-/// settle after the balance check window.
+/// SAFETY: Before each retry, we cancel the previous outstanding order and
+/// check the on-chain balance to see if previous orders already filled
+/// (settlement can lag behind CLOB execution). Orders use FAK (Fill-and-Kill)
+/// so unfilled portions are cancelled by the CLOB, but we cancel explicitly
+/// as defense-in-depth.
 async fn retry_unfilled_leg(
     clob_client: &Arc<ClobClient>,
     env: &Env,
@@ -474,16 +483,45 @@ async fn retry_unfilled_leg(
     original_price: f64,
     market_slug: &str,
     coin: &str,
+    outstanding_order_ids: &mut Vec<String>,
+    market_end_epoch_ms: i64,
 ) -> bool {
     const MAX_RETRIES: u32 = 2;
     const RETRY_DELAY_MS: u64 = 3000;
+    const MIN_TIME_FOR_RETRY_MS: i64 = 30_000;
     let fill_threshold = token_amount * 0.5;
 
     for attempt in 1..=MAX_RETRIES {
+        // Gate retries by remaining time — if market is closing in <30s, skip
+        // and proceed directly to unwind to avoid orders stuck past expiry.
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let remaining_ms = market_end_epoch_ms - now_ms;
+        if remaining_ms < MIN_TIME_FOR_RETRY_MS {
+            println!(
+                "{}",
+                format!(
+                    "[RETRY] {} leg — skipping retry {}: only {:.1}s until market close",
+                    label, attempt, remaining_ms as f64 / 1000.0
+                ).red()
+            );
+            break;
+        }
+
         // Wait before each retry to give on-chain settlement time to catch up.
-        // This is critical: FAK orders fill immediately on CLOB but the on-chain
-        // CTF balance can lag by several seconds.
         tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+
+        // Cancel previous outstanding order(s) before re-submitting (defense-in-depth).
+        // Even with FAK, explicit cancellation prevents any edge case where
+        // a previous order's unfilled portion lingers.
+        for oid in outstanding_order_ids.iter() {
+            if let Err(e) = clob_client.cancel_order(oid).await {
+                println!(
+                    "{}",
+                    format!("[RETRY] Failed to cancel order {}: {} (may already be dead)", &oid[..oid.len().min(16)], e).bright_black()
+                );
+            }
+        }
+        outstanding_order_ids.clear();
 
         // Pre-check: if previous order(s) already settled, skip retry
         let existing_balance = chain_reader::get_ctf_balance(env, unfilled_token_id).await.unwrap_or(0.0);
@@ -523,6 +561,11 @@ async fn retry_unfilled_leg(
             clob_client, unfilled_token_id, label, remaining, original_price,
         ).await;
 
+        // Track the new order ID
+        if let Some(ref oid) = retry_result.order_id {
+            outstanding_order_ids.push(oid.clone());
+        }
+
         if retry_result.success {
             // Verify on-chain with longer wait for settlement
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
@@ -545,13 +588,14 @@ async fn retry_unfilled_leg(
 
     println!(
         "{}",
-        format!("[RETRY] {} leg failed after {} attempts — proceeding to unwind", label, MAX_RETRIES).red()
+        format!("[RETRY] {} leg failed after retries — proceeding to unwind", label).red()
     );
     false
 }
 
 /// Attempt to unwind a single filled leg when the other side didn't fill.
 /// First tries to retry the unfilled leg; only unwinds if retries fail.
+/// Cancels all outstanding orders for the unfilled leg before unwinding.
 async fn attempt_unwind_after_partial_fill(
     clob_client: &Arc<ClobClient>,
     env: &Env,
@@ -565,18 +609,45 @@ async fn attempt_unwind_after_partial_fill(
     down_actual: f64,
     market_slug: &str,
     coin: &str,
+    up_order_ids: &mut Vec<String>,
+    down_order_ids: &mut Vec<String>,
+    market_end_epoch_ms: i64,
 ) {
     if up_filled && !down_filled {
         // UP filled, DOWN didn't — retry DOWN first
         let down_size = floor_to_decimals(up_actual, TOKEN_DECIMALS); // match UP's fill
         let retry_ok = retry_unfilled_leg(
             clob_client, env, down_token_id, "DOWN", down_size, down_result.price,
-            market_slug, coin,
+            market_slug, coin, down_order_ids, market_end_epoch_ms,
         ).await;
 
         if !retry_ok {
+            // Cancel ALL outstanding orders before unwinding to prevent late fills
+            // creating naked exposure on the unfilled leg.
+            println!(
+                "{}",
+                format!(
+                    "[UNWIND] Cancelling {} outstanding DOWN order(s) before unwinding UP",
+                    down_order_ids.len()
+                ).yellow()
+            );
+            for oid in down_order_ids.iter() {
+                if let Err(e) = clob_client.cancel_order(oid).await {
+                    println!(
+                        "{}",
+                        format!("[UNWIND] Cancel order {} failed: {} (may be dead)", &oid[..oid.len().min(16)], e).bright_black()
+                    );
+                }
+            }
+            // Belt-and-suspenders: also cancel all as a blanket sweep
+            if let Err(e) = clob_client.cancel_all_orders().await {
+                println!(
+                    "{}",
+                    format!("[UNWIND] cancel_all_orders failed: {}", e).bright_black()
+                );
+            }
+
             // Final safety check before unwinding: re-read DOWN balance one more time.
-            // FAK orders can settle on-chain after the retry window closed.
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
             let final_down_bal = chain_reader::get_ctf_balance(env, down_token_id).await.unwrap_or(0.0);
             if final_down_bal >= down_size * 0.5 {
@@ -597,6 +668,32 @@ async fn attempt_unwind_after_partial_fill(
                         market_slug, coin,
                     ).await;
                 }
+
+                // Post-unwind safety: check if the unfilled leg tokens appeared
+                // despite cancellation (cancel/fill race condition).
+                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                let late_down_bal = chain_reader::get_ctf_balance(env, down_token_id).await.unwrap_or(0.0);
+                if late_down_bal >= MIN_TOKEN_AMOUNT {
+                    println!(
+                        "{}",
+                        format!(
+                            "⚠️ [POST-UNWIND] DOWN tokens appeared after cancel ({:.2}) — emergency selling",
+                            late_down_bal
+                        ).red().bold()
+                    );
+                    send_telegram_alert(&format!(
+                        "⚠️ POST-UNWIND: {:.2} DOWN tokens appeared after cancel\n📊 {} | {}",
+                        late_down_bal, coin, market_slug
+                    )).await;
+                    let emergency_size = floor_to_decimals(late_down_bal, TOKEN_DECIMALS);
+                    if emergency_size >= MIN_TOKEN_AMOUNT {
+                        try_unwind_sell(
+                            clob_client, down_token_id, "DOWN (post-unwind)", emergency_size,
+                            down_result.price, env.max_unwind_slippage,
+                            market_slug, coin,
+                        ).await;
+                    }
+                }
             }
         }
     } else if down_filled && !up_filled {
@@ -604,10 +701,33 @@ async fn attempt_unwind_after_partial_fill(
         let up_size = floor_to_decimals(down_actual, TOKEN_DECIMALS); // match DOWN's fill
         let retry_ok = retry_unfilled_leg(
             clob_client, env, up_token_id, "UP", up_size, up_result.price,
-            market_slug, coin,
+            market_slug, coin, up_order_ids, market_end_epoch_ms,
         ).await;
 
         if !retry_ok {
+            // Cancel ALL outstanding orders before unwinding
+            println!(
+                "{}",
+                format!(
+                    "[UNWIND] Cancelling {} outstanding UP order(s) before unwinding DOWN",
+                    up_order_ids.len()
+                ).yellow()
+            );
+            for oid in up_order_ids.iter() {
+                if let Err(e) = clob_client.cancel_order(oid).await {
+                    println!(
+                        "{}",
+                        format!("[UNWIND] Cancel order {} failed: {} (may be dead)", &oid[..oid.len().min(16)], e).bright_black()
+                    );
+                }
+            }
+            if let Err(e) = clob_client.cancel_all_orders().await {
+                println!(
+                    "{}",
+                    format!("[UNWIND] cancel_all_orders failed: {}", e).bright_black()
+                );
+            }
+
             // Final safety check before unwinding: re-read UP balance one more time.
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
             let final_up_bal = chain_reader::get_ctf_balance(env, up_token_id).await.unwrap_or(0.0);
@@ -628,6 +748,31 @@ async fn attempt_unwind_after_partial_fill(
                         down_result.price, env.max_unwind_slippage,
                         market_slug, coin,
                     ).await;
+                }
+
+                // Post-unwind safety: check if the unfilled leg tokens appeared
+                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                let late_up_bal = chain_reader::get_ctf_balance(env, up_token_id).await.unwrap_or(0.0);
+                if late_up_bal >= MIN_TOKEN_AMOUNT {
+                    println!(
+                        "{}",
+                        format!(
+                            "⚠️ [POST-UNWIND] UP tokens appeared after cancel ({:.2}) — emergency selling",
+                            late_up_bal
+                        ).red().bold()
+                    );
+                    send_telegram_alert(&format!(
+                        "⚠️ POST-UNWIND: {:.2} UP tokens appeared after cancel\n📊 {} | {}",
+                        late_up_bal, coin, market_slug
+                    )).await;
+                    let emergency_size = floor_to_decimals(late_up_bal, TOKEN_DECIMALS);
+                    if emergency_size >= MIN_TOKEN_AMOUNT {
+                        try_unwind_sell(
+                            clob_client, up_token_id, "UP (post-unwind)", emergency_size,
+                            up_result.price, env.max_unwind_slippage,
+                            market_slug, coin,
+                        ).await;
+                    }
                 }
             }
         }

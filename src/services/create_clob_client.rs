@@ -2,7 +2,7 @@ use crate::config::Env;
 use anyhow::{anyhow, Result};
 use colored::*;
 use polymarket_client_sdk::clob::{Client as SdkClobClient, Config as ClobConfig};
-use polymarket_client_sdk::clob::types::{Side, SignatureType};
+use polymarket_client_sdk::clob::types::{OrderType, Side, SignatureType};
 use polymarket_client_sdk::types::Decimal;
 use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::auth::{Normal, Signer};
@@ -46,6 +46,7 @@ impl ClobClient {
             .price(price_dec)
             .size(size_dec)
             .side(sdk_side)
+            .order_type(OrderType::FAK)
             .build()
             .await
             .map_err(|e| anyhow!("Order build failed: {}", e))?;
@@ -63,6 +64,29 @@ impl ClobClient {
             order_id: Some(resp.order_id.to_string()),
             error: None,
         })
+    }
+
+    /// Cancel a single open order by its order ID.
+    pub async fn cancel_order(&self, order_id: &str) -> Result<()> {
+        self.client
+            .cancel_order(order_id)
+            .await
+            .map_err(|e| anyhow!("Cancel order {} failed: {}", order_id, e))?;
+        println!(
+            "{}",
+            format!("✓ Cancelled order {}", &order_id[..order_id.len().min(16)]).yellow()
+        );
+        Ok(())
+    }
+
+    /// Cancel all open orders for this account (nuclear option before unwind).
+    pub async fn cancel_all_orders(&self) -> Result<()> {
+        self.client
+            .cancel_all_orders()
+            .await
+            .map_err(|e| anyhow!("Cancel all orders failed: {}", e))?;
+        println!("{}", "✓ Cancelled all open orders".yellow());
+        Ok(())
     }
 }
 

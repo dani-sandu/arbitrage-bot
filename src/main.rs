@@ -445,7 +445,7 @@ async fn discover_and_monitor(
                     else {
                         // All guards passed — attempt trade
                         let opportunity_key = market.slug.clone();
-                        let is_market_open = time_until_end > 5000;
+                        let is_market_open = time_until_end > 90_000;
 
                         // === GUARD 8: Persistent state — check if already traded this market ===
                         let already_traded = persistent_state.lock().await.was_traded(&opportunity_key);
@@ -478,6 +478,7 @@ async fn discover_and_monitor(
 
                                 let market_trade = market.clone();
                                 let ws_for_trade = ws_ref.clone();
+                                let market_end_epoch_ms = end_date.timestamp_millis();
 
                                 tokio::spawn(async move {
                                     // Re-check prices to avoid trading on stale data
@@ -509,6 +510,7 @@ async fn discover_and_monitor(
                                                     &env_trade,
                                                     &market_trade.slug,
                                                     &market_trade.coin,
+                                                    market_end_epoch_ms,
                                                 ).await {
                                                     Ok((up_res, down_res, both_ok)) => {
                                                         traded = both_ok || up_res.success || down_res.success;
