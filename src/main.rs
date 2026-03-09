@@ -420,12 +420,34 @@ async fn discover_and_monitor(
                             .yellow()
                         );
                     }
+                    // === GUARD 6: Bid-side liquidity — need bids for unwind if one leg fails ===
+                    else if price_data.up_bid_depth == 0 || price_data.down_bid_depth == 0 {
+                        println!(
+                            "{}",
+                            format!(
+                                "[GUARD] Skipping: no bid-side liquidity for unwind (UP bids: {} levels, DOWN bids: {} levels)",
+                                price_data.up_bid_depth, price_data.down_bid_depth
+                            )
+                            .yellow()
+                        );
+                    }
+                    // === GUARD 7: Total ask depth — require enough total size, not just top-of-book ===
+                    else if price_data.up_total_ask_size < env.token_amount || price_data.down_total_ask_size < env.token_amount {
+                        println!(
+                            "{}",
+                            format!(
+                                "[GUARD] Skipping: insufficient total ask depth (UP: {:.2}, DOWN: {:.2}, need: {:.2})",
+                                price_data.up_total_ask_size, price_data.down_total_ask_size, env.token_amount
+                            )
+                            .yellow()
+                        );
+                    }
                     else {
                         // All guards passed — attempt trade
                         let opportunity_key = market.slug.clone();
                         let is_market_open = time_until_end > 5000;
 
-                        // === GUARD 6: Persistent state — check if already traded this market ===
+                        // === GUARD 8: Persistent state — check if already traded this market ===
                         let already_traded = persistent_state.lock().await.was_traded(&opportunity_key);
 
                         let client_arc = {
@@ -485,6 +507,8 @@ async fn discover_and_monitor(
                                                     fresh_up_size.min(available_up),
                                                     fresh_down_size.min(available_down),
                                                     &env_trade,
+                                                    &market_trade.slug,
+                                                    &market_trade.coin,
                                                 ).await {
                                                     Ok((up_res, down_res, both_ok)) => {
                                                         traded = both_ok || up_res.success || down_res.success;

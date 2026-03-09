@@ -30,6 +30,18 @@ pub struct PriceData {
     pub up_ask_depth: usize,
     /// Number of ask levels in the DOWN orderbook
     pub down_ask_depth: usize,
+    /// Size available at the best bid for the UP token (needed for unwind feasibility)
+    pub up_bid_size: f64,
+    /// Size available at the best bid for the DOWN token
+    pub down_bid_size: f64,
+    /// Number of bid levels in the UP orderbook
+    pub up_bid_depth: usize,
+    /// Number of bid levels in the DOWN orderbook
+    pub down_bid_depth: usize,
+    /// Total ask size across all levels for UP
+    pub up_total_ask_size: f64,
+    /// Total ask size across all levels for DOWN
+    pub down_total_ask_size: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +88,19 @@ pub fn create_price_data(
     let up_ask_depth = up_snapshot.map(|s| s.asks.len()).unwrap_or(0);
     let down_ask_depth = down_snapshot.map(|s| s.asks.len()).unwrap_or(0);
 
+    let up_bid_size = up_snapshot
+        .and_then(|s| s.bids.first())
+        .map(|b| b.size)
+        .unwrap_or(0.0);
+    let down_bid_size = down_snapshot
+        .and_then(|s| s.bids.first())
+        .map(|b| b.size)
+        .unwrap_or(0.0);
+    let up_bid_depth = up_snapshot.map(|s| s.bids.len()).unwrap_or(0);
+    let down_bid_depth = down_snapshot.map(|s| s.bids.len()).unwrap_or(0);
+    let up_total_ask_size: f64 = up_snapshot.map(|s| s.asks.iter().map(|l| l.size).sum()).unwrap_or(0.0);
+    let down_total_ask_size: f64 = down_snapshot.map(|s| s.asks.iter().map(|l| l.size).sum()).unwrap_or(0.0);
+
     let up_spread = if up_ask > 0.0 && up_bid > 0.0 { up_ask - up_bid } else { 0.0 };
     let down_spread = if down_ask > 0.0 && down_bid > 0.0 { down_ask - down_bid } else { 0.0 };
 
@@ -101,6 +126,12 @@ pub fn create_price_data(
         down_spread,
         up_ask_depth,
         down_ask_depth,
+        up_bid_size,
+        down_bid_size,
+        up_bid_depth,
+        down_bid_depth,
+        up_total_ask_size,
+        down_total_ask_size,
     }
 }
 

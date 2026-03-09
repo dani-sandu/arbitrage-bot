@@ -163,6 +163,8 @@ pub async fn execute_arbitrage_trade(
     available_up: f64,
     available_down: f64,
     env: &Env,
+    market_slug: &str,
+    coin: &str,
 ) -> Result<(ArbitrageOrderResult, ArbitrageOrderResult, bool)> {
     if up_token_id.trim().is_empty() || down_token_id.trim().is_empty() {
         return Err(anyhow!("Invalid token IDs"));
@@ -211,7 +213,8 @@ pub async fn execute_arbitrage_trade(
     println!(
         "{}",
         format!(
-            "\n⚡ Executing arbitrage ({:.2} tokens each)\n  UP: ${:.4} (ask ${:.4} + {:.2}¢ buffer) → ${:.2} USDC\n  DOWN: ${:.4} (ask ${:.4} + {:.2}¢ buffer) → ${:.2} USDC\n  Net spread after fees: {:.4} ({:.2}%)\n  Mode: {}\n",
+            "\n⚡ Executing arbitrage [{} / {}] ({:.2} tokens each)\n  UP: ${:.4} (ask ${:.4} + {:.2}¢ buffer) → ${:.2} USDC\n  DOWN: ${:.4} (ask ${:.4} + {:.2}¢ buffer) → ${:.2} USDC\n  Net spread after fees: {:.4} ({:.2}%)\n  Mode: {}\n",
+            coin, market_slug,
             token_amount, buffered_up_price, up_price, env.buy_price_buffer * 100.0, up_usdc,
             buffered_down_price, down_price, env.buy_price_buffer * 100.0, down_usdc,
             net_spread, net_spread * 100.0,
@@ -298,7 +301,8 @@ pub async fn execute_arbitrage_trade(
                 .bold()
             );
             let msg = format!(
-                "🎉 ARBITRAGE COMPLETED\nUP: {:.2} tokens @ ${:.4} = ${:.2}\nDOWN: {:.2} tokens @ ${:.4} = ${:.2}\nTotal: ${:.2} USDC\nNet profit: ~${:.4}",
+                "🎉 ARBITRAGE COMPLETED\n📊 {} | {}\nUP: {:.2} tokens @ ${:.4} = ${:.2}\nDOWN: {:.2} tokens @ ${:.4} = ${:.2}\nTotal: ${:.2} USDC\nNet profit: ~${:.4}",
+                coin, market_slug,
                 up_result.tokens_bought.unwrap_or(0.0), up_result.price, up_result.amount,
                 down_result.tokens_bought.unwrap_or(0.0), down_result.price, down_result.amount,
                 up_result.amount + down_result.amount,
@@ -319,10 +323,9 @@ pub async fn execute_arbitrage_trade(
                 up_token_id, down_token_id,
                 &up_result, &down_result,
                 up_filled, down_filled,
-                up_actual, down_actual,
-            ).await;
+                up_actual, down_actual,                market_slug, coin,            ).await;
 
-            let msg = format!("⚠️ ARBITRAGE FILL FAILED\n{}", fail_detail);
+            let msg = format!("⚠️ ARBITRAGE FILL FAILED\n📊 {} | {}\n{}", coin, market_slug, fail_detail);
             send_telegram_alert(&msg).await;
         }
     } else {
@@ -334,6 +337,7 @@ pub async fn execute_arbitrage_trade(
             up_result.success, down_result.success,
             if up_result.success { up_result.tokens_bought.unwrap_or(0.0) } else { 0.0 },
             if down_result.success { down_result.tokens_bought.unwrap_or(0.0) } else { 0.0 },
+            market_slug, coin,
         ).await;
 
         let error_msg = format!(
@@ -343,7 +347,7 @@ pub async fn execute_arbitrage_trade(
         );
         println!("{}", format!("⚠️  {}", error_msg).red().bold());
         log_error(&error_msg, Some("execute_arbitrage_trade"));
-        let msg = format!("⚠️ ARBITRAGE FAILED\n{}", error_msg);
+        let msg = format!("⚠️ ARBITRAGE FAILED\n📊 {} | {}\n{}", coin, market_slug, error_msg);
         send_telegram_alert(&msg).await;
     }
 
@@ -403,6 +407,8 @@ async fn try_unwind_sell(
     size: f64,
     buy_price: f64,
     max_slippage: f64,
+    market_slug: &str,
+    coin: &str,
 ) -> bool {
     // Stage 1: configured slippage
     let stage1_price = compute_unwind_price(buy_price, max_slippage);
@@ -417,7 +423,7 @@ async fn try_unwind_sell(
         Ok(_) => {
             println!("{}", format!("✓ {} leg unwound (stage 1)", label).green());
             send_telegram_alert(&format!(
-                "🔄 Unwound {} leg ({:.2} tokens @ ${:.4})", label, size, stage1_price
+                "🔄 Unwound {} leg ({:.2} tokens @ ${:.4})\n📊 {} | {}", label, size, stage1_price, coin, market_slug
             )).await;
             return true;
         }
@@ -438,12 +444,12 @@ async fn try_unwind_sell(
         Ok(_) => {
             println!("{}", format!("✓ {} leg unwound (stage 2 — emergency)", label).green());
             send_telegram_alert(&format!(
-                "🚨 Emergency unwind {} ({:.2} tokens @ ${:.4})", label, size, UNWIND_PRICE_FLOOR
+                "🚨 Emergency unwind {} ({:.2} tokens @ ${:.4})\n📊 {} | {}", label, size, UNWIND_PRICE_FLOOR, coin, market_slug
             )).await;
             return true;
         }
         Err(e) => {
-            let msg = format!("⚠️ UNWIND FAILED ({}): {} — {:.2} tokens remain exposed", label, e, size);
+            let msg = format!("⚠️ UNWIND FAILED ({}) [{}|{}]: {} — {:.2} tokens remain exposed", label, coin, market_slug, e, size);
             println!("{}", msg.red());
             send_telegram_alert(&msg).await;
             log_error(&msg, Some(&format!("unwind_{}", label.to_lowercase())));
@@ -452,34 +458,116 @@ async fn try_unwind_sell(
     }
 }
 
+/// Attempt to retry the unfilled leg before resorting to unwind.
+/// Returns true if the retry succeeded and both legs are now filled.
+async fn retry_unfilled_leg(
+    clob_client: &Arc<ClobClient>,
+    env: &Env,
+    unfilled_token_id: &str,
+    label: &str,
+    token_amount: f64,
+    original_price: f64,
+    market_slug: &str,
+    coin: &str,
+) -> bool {
+    const MAX_RETRIES: u32 = 2;
+    const RETRY_DELAY_MS: u64 = 1500;
+
+    for attempt in 1..=MAX_RETRIES {
+        println!(
+            "{}",
+            format!(
+                "[RETRY {}/{}] Re-submitting {} leg ({:.2} tokens @ ${:.4})...",
+                attempt, MAX_RETRIES, label, token_amount, original_price
+            ).yellow()
+        );
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+
+        let retry_result = execute_buy_order(
+            clob_client, unfilled_token_id, label, token_amount, original_price,
+        ).await;
+
+        if retry_result.success {
+            // Verify on-chain
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            let balance = chain_reader::get_ctf_balance(env, unfilled_token_id).await.unwrap_or(0.0);
+            if balance >= token_amount * 0.5 {
+                println!(
+                    "{}",
+                    format!(
+                        "✓ [RETRY] {} leg filled on retry {} ({:.2} tokens on-chain)",
+                        label, attempt, balance
+                    ).green()
+                );
+                send_telegram_alert(&format!(
+                    "🔄 {} leg filled on retry {} ({:.2} tokens)\n📊 {} | {}", label, attempt, balance, coin, market_slug
+                )).await;
+                return true;
+            }
+        }
+    }
+
+    println!(
+        "{}",
+        format!("[RETRY] {} leg failed after {} attempts — proceeding to unwind", label, MAX_RETRIES).red()
+    );
+    false
+}
+
 /// Attempt to unwind a single filled leg when the other side didn't fill.
+/// First tries to retry the unfilled leg; only unwinds if retries fail.
 async fn attempt_unwind_after_partial_fill(
     clob_client: &Arc<ClobClient>,
     env: &Env,
     up_token_id: &str,
     down_token_id: &str,
     up_result: &ArbitrageOrderResult,
-    _down_result: &ArbitrageOrderResult,
+    down_result: &ArbitrageOrderResult,
     up_filled: bool,
     down_filled: bool,
     up_actual: f64,
     down_actual: f64,
+    market_slug: &str,
+    coin: &str,
 ) {
     if up_filled && !down_filled {
-        let size = floor_to_decimals(up_actual, TOKEN_DECIMALS);
-        if size >= MIN_TOKEN_AMOUNT {
-            try_unwind_sell(
-                clob_client, up_token_id, "UP", size,
-                up_result.price, env.max_unwind_slippage,
-            ).await;
+        // UP filled, DOWN didn't — retry DOWN first
+        let down_size = floor_to_decimals(up_actual, TOKEN_DECIMALS); // match UP's fill
+        let retry_ok = retry_unfilled_leg(
+            clob_client, env, down_token_id, "DOWN", down_size, down_result.price,
+            market_slug, coin,
+        ).await;
+
+        if !retry_ok {
+            // Retry failed — unwind UP using UP's buy price
+            let size = floor_to_decimals(up_actual, TOKEN_DECIMALS);
+            if size >= MIN_TOKEN_AMOUNT {
+                try_unwind_sell(
+                    clob_client, up_token_id, "UP", size,
+                    up_result.price, env.max_unwind_slippage,
+                    market_slug, coin,
+                ).await;
+            }
         }
     } else if down_filled && !up_filled {
-        let size = floor_to_decimals(down_actual, TOKEN_DECIMALS);
-        if size >= MIN_TOKEN_AMOUNT {
-            try_unwind_sell(
-                clob_client, down_token_id, "DOWN", size,
-                up_result.price, env.max_unwind_slippage,
-            ).await;
+        // DOWN filled, UP didn't — retry UP first
+        let up_size = floor_to_decimals(down_actual, TOKEN_DECIMALS); // match DOWN's fill
+        let retry_ok = retry_unfilled_leg(
+            clob_client, env, up_token_id, "UP", up_size, up_result.price,
+            market_slug, coin,
+        ).await;
+
+        if !retry_ok {
+            // Retry failed — unwind DOWN using DOWN's buy price (not UP's!)
+            let size = floor_to_decimals(down_actual, TOKEN_DECIMALS);
+            if size >= MIN_TOKEN_AMOUNT {
+                try_unwind_sell(
+                    clob_client, down_token_id, "DOWN", size,
+                    down_result.price, env.max_unwind_slippage,
+                    market_slug, coin,
+                ).await;
+            }
         }
     }
 
