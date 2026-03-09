@@ -90,7 +90,19 @@ async fn execute_buy_order(
         return create_error_result(token_id, side, format!("Size {:.2} below minimum {:.2}", size, MIN_TOKEN_AMOUNT));
     }
 
+    // Ensure size * price yields at most PRICE_DECIMALS decimal places (Polymarket API
+    // rejects orders where the USDC maker amount exceeds 2 decimal places). Back-compute
+    // the adjusted size from the floored USDC amount to guarantee a clean multiplication.
     let usdc_cost = floor_to_decimals(size * floored_price, PRICE_DECIMALS);
+    let size = if floored_price > 0.0 {
+        floor_to_decimals(usdc_cost / floored_price, TOKEN_DECIMALS)
+    } else {
+        size
+    };
+    if size < MIN_TOKEN_AMOUNT {
+        return create_error_result(token_id, side, format!("Adjusted size {:.2} below minimum {:.2}", size, MIN_TOKEN_AMOUNT));
+    }
+
     if usdc_cost < MIN_ORDER_SIZE_USD {
         return create_error_result(
             token_id,
@@ -236,10 +248,24 @@ pub async fn execute_arbitrage_trade(
             return Ok((up_result, down_result, false));
         }
 
-        // Verify the UP leg actually filled on-chain before committing to DOWN
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-        let up_balance = chain_reader::get_ctf_balance(env, up_token_id).await.unwrap_or(0.0);
+        // Verify the UP leg actually filled on-chain before committing to DOWN.
+        // Poll up to 5 times × 3s to account for Polygon settlement lag (can take 6–12s).
         let fill_threshold = token_amount * 0.5;
+        let mut up_balance = 0.0;
+        for attempt in 1..=5u32 {
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            up_balance = chain_reader::get_ctf_balance(env, up_token_id).await.unwrap_or(0.0);
+            println!(
+                "{}",
+                format!(
+                    "[SEQUENTIAL] UP balance check {}/5: {:.2}/{:.2}",
+                    attempt, up_balance, token_amount
+                ).bright_black()
+            );
+            if up_balance >= fill_threshold {
+                break;
+            }
+        }
 
         if up_balance < fill_threshold {
             println!(
@@ -250,6 +276,22 @@ pub async fn execute_arbitrage_trade(
                 ).yellow()
             );
             let down_result = create_error_result(down_token_id, "DOWN", "Skipped: UP leg not filled on-chain".to_string());
+            // If UP had a CLOB order_id, it may have filled on-chain after our window.
+            // Place a preemptive unwind sell to prevent one-legged exposure.
+            if up_result.order_id.is_some() {
+                let size = floor_to_decimals(token_amount, TOKEN_DECIMALS);
+                if size >= MIN_TOKEN_AMOUNT {
+                    println!(
+                        "{}",
+                        format!("[SEQUENTIAL] Placing preemptive unwind sell for UP ({:.2} tokens)", size).yellow()
+                    );
+                    try_unwind_sell(
+                        clob_client, up_token_id, "UP", size,
+                        up_result.price, env.max_unwind_slippage,
+                        market_slug, coin,
+                    ).await;
+                }
+            }
             return Ok((up_result, down_result, false));
         }
 
@@ -280,12 +322,44 @@ pub async fn execute_arbitrage_trade(
     let mut up_order_ids: Vec<String> = up_result.order_id.iter().cloned().collect();
     let mut down_order_ids: Vec<String> = down_result.order_id.iter().cloned().collect();
 
+    // Detect immediate FAK kills: success=true but order_id=None means the CLOB found
+    // no resting orders to match and killed the order immediately. Skip the slow 15-second
+    // poll and go directly to the retry/unwind path.
+    let up_fak_killed = up_result.success && up_result.order_id.is_none();
+    let down_fak_killed = down_result.success && down_result.order_id.is_none();
+
     if both_submitted {
         // Both orders accepted by CLOB — verify actual fills on-chain before celebrating.
         // FAK orders can be accepted but not filled if liquidity disappeared.
-        let (up_actual, down_actual) = poll_fill_balances(
-            env, up_token_id, down_token_id, token_amount,
-        ).await;
+        let (up_actual, down_actual) = if up_fak_killed || down_fak_killed {
+            // Fast path: at least one leg was immediately killed (no resting orders matched).
+            // We already know the killed leg has 0 fill. Give the other leg a brief window
+            // to settle on-chain before reading its balance.
+            if !up_fak_killed || !down_fak_killed {
+                tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
+            }
+            let up_actual = if up_fak_killed {
+                0.0
+            } else {
+                chain_reader::get_ctf_balance(env, up_token_id).await.unwrap_or(0.0)
+            };
+            let down_actual = if down_fak_killed {
+                0.0
+            } else {
+                chain_reader::get_ctf_balance(env, down_token_id).await.unwrap_or(0.0)
+            };
+            println!(
+                "{}",
+                format!(
+                    "[FAK FAST-PATH] UP: {:.2} ({}), DOWN: {:.2} ({})",
+                    up_actual, if up_fak_killed { "killed" } else { "filled" },
+                    down_actual, if down_fak_killed { "killed" } else { "filled" },
+                ).yellow()
+            );
+            (up_actual, down_actual)
+        } else {
+            poll_fill_balances(env, up_token_id, down_token_id, token_amount).await
+        };
 
         let fill_threshold = token_amount * 0.5;
         let up_filled = up_actual >= fill_threshold;
