@@ -363,8 +363,8 @@ async fn poll_fill_balances(
     down_token_id: &str,
     expected_tokens: f64,
 ) -> (f64, f64) {
-    const MAX_ATTEMPTS: u32 = 4;
-    const DELAY_SECS: u64 = 2;
+    const MAX_ATTEMPTS: u32 = 5;
+    const DELAY_SECS: u64 = 3;
     let fill_threshold = expected_tokens * 0.5;
 
     for attempt in 0..MAX_ATTEMPTS {
@@ -460,6 +460,11 @@ async fn try_unwind_sell(
 
 /// Attempt to retry the unfilled leg before resorting to unwind.
 /// Returns true if the retry succeeded and both legs are now filled.
+///
+/// SAFETY: Before each retry, we check the on-chain balance to see if
+/// previous orders already filled (settlement can lag behind CLOB execution).
+/// This prevents accumulating 2-3× the intended position when FAK orders
+/// settle after the balance check window.
 async fn retry_unfilled_leg(
     clob_client: &Arc<ClobClient>,
     env: &Env,
@@ -471,28 +476,58 @@ async fn retry_unfilled_leg(
     coin: &str,
 ) -> bool {
     const MAX_RETRIES: u32 = 2;
-    const RETRY_DELAY_MS: u64 = 1500;
+    const RETRY_DELAY_MS: u64 = 3000;
+    let fill_threshold = token_amount * 0.5;
 
     for attempt in 1..=MAX_RETRIES {
+        // Wait before each retry to give on-chain settlement time to catch up.
+        // This is critical: FAK orders fill immediately on CLOB but the on-chain
+        // CTF balance can lag by several seconds.
+        tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+
+        // Pre-check: if previous order(s) already settled, skip retry
+        let existing_balance = chain_reader::get_ctf_balance(env, unfilled_token_id).await.unwrap_or(0.0);
+        if existing_balance >= fill_threshold {
+            println!(
+                "{}",
+                format!(
+                    "✓ [RETRY] {} leg already filled before retry {} ({:.2} tokens on-chain)",
+                    label, attempt, existing_balance
+                ).green()
+            );
+            return true;
+        }
+
+        // Only retry for the remaining unfilled amount
+        let remaining = floor_to_decimals(token_amount - existing_balance, TOKEN_DECIMALS);
+        if remaining < MIN_TOKEN_AMOUNT {
+            println!(
+                "{}",
+                format!(
+                    "✓ [RETRY] {} leg mostly filled ({:.2}/{:.2}), remaining {:.2} below minimum — treating as filled",
+                    label, existing_balance, token_amount, remaining
+                ).green()
+            );
+            return true;
+        }
+
         println!(
             "{}",
             format!(
-                "[RETRY {}/{}] Re-submitting {} leg ({:.2} tokens @ ${:.4})...",
-                attempt, MAX_RETRIES, label, token_amount, original_price
+                "[RETRY {}/{}] Re-submitting {} leg ({:.2} tokens @ ${:.4}, existing: {:.2})...",
+                attempt, MAX_RETRIES, label, remaining, original_price, existing_balance
             ).yellow()
         );
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
-
         let retry_result = execute_buy_order(
-            clob_client, unfilled_token_id, label, token_amount, original_price,
+            clob_client, unfilled_token_id, label, remaining, original_price,
         ).await;
 
         if retry_result.success {
-            // Verify on-chain
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            // Verify on-chain with longer wait for settlement
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
             let balance = chain_reader::get_ctf_balance(env, unfilled_token_id).await.unwrap_or(0.0);
-            if balance >= token_amount * 0.5 {
+            if balance >= fill_threshold {
                 println!(
                     "{}",
                     format!(
@@ -540,14 +575,28 @@ async fn attempt_unwind_after_partial_fill(
         ).await;
 
         if !retry_ok {
-            // Retry failed — unwind UP using UP's buy price
-            let size = floor_to_decimals(up_actual, TOKEN_DECIMALS);
-            if size >= MIN_TOKEN_AMOUNT {
-                try_unwind_sell(
-                    clob_client, up_token_id, "UP", size,
-                    up_result.price, env.max_unwind_slippage,
-                    market_slug, coin,
-                ).await;
+            // Final safety check before unwinding: re-read DOWN balance one more time.
+            // FAK orders can settle on-chain after the retry window closed.
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            let final_down_bal = chain_reader::get_ctf_balance(env, down_token_id).await.unwrap_or(0.0);
+            if final_down_bal >= down_size * 0.5 {
+                println!(
+                    "{}",
+                    format!(
+                        "✓ [UNWIND ABORTED] DOWN leg settled late ({:.2} tokens on-chain) — both legs filled",
+                        final_down_bal
+                    ).green()
+                );
+            } else {
+                // Retry failed and DOWN truly unfilled — unwind UP using UP's buy price
+                let size = floor_to_decimals(up_actual, TOKEN_DECIMALS);
+                if size >= MIN_TOKEN_AMOUNT {
+                    try_unwind_sell(
+                        clob_client, up_token_id, "UP", size,
+                        up_result.price, env.max_unwind_slippage,
+                        market_slug, coin,
+                    ).await;
+                }
             }
         }
     } else if down_filled && !up_filled {
@@ -559,14 +608,27 @@ async fn attempt_unwind_after_partial_fill(
         ).await;
 
         if !retry_ok {
-            // Retry failed — unwind DOWN using DOWN's buy price (not UP's!)
-            let size = floor_to_decimals(down_actual, TOKEN_DECIMALS);
-            if size >= MIN_TOKEN_AMOUNT {
-                try_unwind_sell(
-                    clob_client, down_token_id, "DOWN", size,
-                    down_result.price, env.max_unwind_slippage,
-                    market_slug, coin,
-                ).await;
+            // Final safety check before unwinding: re-read UP balance one more time.
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            let final_up_bal = chain_reader::get_ctf_balance(env, up_token_id).await.unwrap_or(0.0);
+            if final_up_bal >= up_size * 0.5 {
+                println!(
+                    "{}",
+                    format!(
+                        "✓ [UNWIND ABORTED] UP leg settled late ({:.2} tokens on-chain) — both legs filled",
+                        final_up_bal
+                    ).green()
+                );
+            } else {
+                // Retry failed and UP truly unfilled — unwind DOWN using DOWN's buy price
+                let size = floor_to_decimals(down_actual, TOKEN_DECIMALS);
+                if size >= MIN_TOKEN_AMOUNT {
+                    try_unwind_sell(
+                        clob_client, down_token_id, "DOWN", size,
+                        down_result.price, env.max_unwind_slippage,
+                        market_slug, coin,
+                    ).await;
+                }
             }
         }
     }
